@@ -1,0 +1,13 @@
+{
+  "name": "MyGo Emby",
+  "identifier": "dev.jackie.mygo-emby",
+  "version": "0.1.0",
+  "out": "build",
+  "macos": {
+    "infoPlist": {
+      "NSAppTransportSecurity": {
+        "NSAllowsLocalNetworking": true
+      }
+    }
+  }
+}

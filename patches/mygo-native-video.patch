@@ -1,0 +1,114 @@
+--- a/ui/webview.go
++++ b/ui/webview.go
+@@ -90,6 +90,9 @@
+ 	if pv == nil {
+ 		pv = &platformView{h: h}
+ 		rt.platformViews = append(rt.platformViews, pv)
++		if owner, ok := v.(interface{ onNativeViewClose(func()) }); ok {
++			owner.onNativeViewClose(pv.leave)
++		}
+ 	}
+ 	return coreWebView(c, pv)
+ }
+@@ -123,10 +126,13 @@
+ 	if p.embed != nil && p.conn == conn {
+ 		return p.embed
+ 	}
+-	if viewhost.Embed == nil {
+-		return nil
+-	}
+-	e := viewhost.Embed(conn.Surface, p.h, p.leave)
++	var e platform.WebView
++	if viewhost.Embed != nil {
++		e = viewhost.Embed(conn.Surface, p.h, p.leave)
++	} else if host, ok := conn.Surface.(platform.ViewSurface); ok {
++		// A Go owner can host a system view without a Swift module.
++		e, _ = host.EmbedView(p.h)
++	}
+ 	if e == nil {
+ 		return nil
+ 	}
+--- /dev/null
++++ b/ui/platform_view.go
+@@ -0,0 +1,31 @@
++package ui
++
++// PlatformViewHandle registers an externally owned platform view with NativeView.
++// Create, show and close it on the main thread. Close detaches every toolkit
++// host; the caller must then release its own native object.
++type PlatformViewHandle struct {
++	handle uintptr
++	closed []func()
++}
++
++// HostPlatformView wraps an NSView* on macOS for NativeView. It does not retain
++// the object: the caller keeps it alive until after Close.
++func HostPlatformView(handle uintptr) *PlatformViewHandle {
++	return &PlatformViewHandle{handle: handle}
++}
++
++func (v *PlatformViewHandle) NativeView() uintptr { return v.handle }
++
++func (v *PlatformViewHandle) onNativeViewClose(fn func()) { v.closed = append(v.closed, fn) }
++
++// Close detaches the view from windows before its owner releases it.
++func (v *PlatformViewHandle) Close() {
++	if v.handle == 0 {
++		return
++	}
++	v.handle = 0
++	for _, fn := range v.closed {
++		fn()
++	}
++	v.closed = nil
++}
+--- /dev/null
++++ b/ui/platform_view_test.go
+@@ -0,0 +1,35 @@
++package ui
++
++import "testing"
++
++func TestHostedPlatformViewClosesAllRegistrations(t *testing.T) {
++	v := HostPlatformView(1234)
++	view := func(c *Context) { NativeView(c, v).Fill() }
++	a, b := NewTester(view, 320, 240), NewTester(view, 640, 480)
++	a.Frame()
++	b.Frame()
++	if len(a.rt.platformViews) != 1 || len(b.rt.platformViews) != 1 {
++		t.Fatal("the view was not registered in both windows")
++	}
++	v.Close()
++	v.Close()
++	if v.NativeView() != 0 {
++		t.Fatal("closed view still exposes a native handle")
++	}
++	a.Frame()
++	b.Frame()
++	if len(a.rt.platformViews) != 0 || len(b.rt.platformViews) != 0 {
++		t.Fatal("closing retained a toolkit registration")
++	}
++}
++
++func TestHostedPlatformViewCloseNotifiesOnce(t *testing.T) {
++	v := HostPlatformView(42)
++	calls := 0
++	v.onNativeViewClose(func() { calls++ })
++	v.Close()
++	v.Close()
++	if calls != 1 {
++		t.Fatalf("close callback ran %d times", calls)
++	}
++}
+--- a/internal/darwin/surface.go
++++ b/internal/darwin/surface.go
+@@ -219,6 +219,9 @@
+ 	send(s.view, "registerForDraggedTypes:", uintptr(nsArray(nsString("public.file-url"))))
+ 	w.surface = s
+ 	w.b.bySurface[s.view] = s
++	// Full-screen playback must continue receiving motion while its controls
++	// and cursor are hidden, including after AppKit changes tracking views.
++	send(w.win, "setAcceptsMouseMovedEvents:", 1)
+ 	w.b.watchCommandKeyUps()
+ }
+ 
