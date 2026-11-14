@@ -190,6 +190,9 @@ func (p *Playback) AudioTrack(index int) *Track {
 // PlaybackInfo asks the server how to play itemID (POST
 // /Items/{id}/PlaybackInfo with the AVPlayer DeviceProfile) and resolves
 // the answer into a ready-to-play stream URL plus track lists.
+// If the selected source offers no playback path, it returns a partial
+// Playback alongside ErrNotPlayable. Only its source/session metadata is
+// available, so callers can request another version from MediaSources.
 func (c *Client) PlaybackInfo(ctx context.Context, itemID string, opts PlaybackOptions) (*Playback, error) {
 	const op = "POST /Items/{id}/PlaybackInfo"
 	uid, err := c.requireUser(op)
@@ -272,11 +275,15 @@ func (c *Client) resolvePlayback(itemID string, resp *PlaybackInfoResponse, opts
 	}
 	src := &resp.MediaSources[0]
 	if opts.MediaSourceID != "" {
+		src = nil
 		for i := range resp.MediaSources {
 			if resp.MediaSources[i].ID == opts.MediaSourceID {
 				src = &resp.MediaSources[i]
 				break
 			}
+		}
+		if src == nil {
+			return nil, &Error{Kind: KindBadResponse, Op: op, Message: "server did not return the requested media source"}
 		}
 	}
 
@@ -324,7 +331,7 @@ func (c *Client) resolvePlayback(itemID string, resp *PlaybackInfoResponse, opts
 		if msg == "" {
 			msg = "server offers neither direct play nor transcoding for this item"
 		}
-		return nil, &Error{Kind: KindNotPlayable, Op: op, Message: msg}
+		return p, &Error{Kind: KindNotPlayable, Op: op, Message: msg}
 	}
 	if p.IsHLS {
 		p.NativelyPlayable = true
@@ -455,6 +462,22 @@ func transcodeReasonsFromURL(u string) []string {
 		return nil
 	}
 	return strings.Split(r, ",")
+}
+
+// DirectStreamURL returns a static stream URL suitable for handing off to an
+// external player, handling a nil MediaSource safely.
+func (c *Client) DirectStreamURL(itemID string, src *MediaSource) string {
+	if c == nil || itemID == "" {
+		return ""
+	}
+	var s MediaSource
+	if src != nil {
+		s = *src
+	}
+	if s.ID == "" {
+		s.ID = itemID
+	}
+	return c.directStreamURL(itemID, &s, "")
 }
 
 // directStreamURL returns the static stream URL of a source: the server's

@@ -141,6 +141,8 @@ type uiStrings struct {
 	SortAdded       string
 	SortYear        string
 	SortRating      string
+	SortPlayed      string
+	SortRuntime     string
 	Ascending       string
 	Descending      string
 	FilterAll       string
@@ -152,24 +154,35 @@ type uiStrings struct {
 	EmptyFilterBody string
 	EmptyFolder     string
 	BoxSet          string
+	Genre           string
+	GenreEmpty      string
 
-	// The player.
-	// Items' pages.
-	Cast             string
-	Similar          string
-	Version          string
-	Audio            string
-	Subtitles        string
-	SubtitlesOff     string
-	Favorited        string
-	PlayedDone       string
-	Directors        string
-	Studios          string
-	ResumeLeftFmt    string // time left
-	PlayEpisodeFmt   string // episode
-	ResumeEpisodeFmt string // episode
-	EpisodeNumFmt    string // number, name
-	SeriesLink       string
+	// The player & items' pages.
+	Cast              string
+	Similar           string
+	Chapters          string
+	ChapterNumFmt     string // 1-based chapter index
+	Version           string
+	Audio             string
+	Subtitles         string
+	SubtitlesOff      string
+	Favorited         string
+	PlayedDone        string
+	ResetProgress     string
+	OpenExternal      string
+	OpenWithFmt       string // external player name
+	OpenedExternalFmt string // external player name
+	ExternalFailedFmt string // error
+	Directors         string
+	Studios           string
+	ResumeLeftFmt     string // time left
+	PlayEpisodeFmt    string // episode
+	ResumeEpisodeFmt  string // episode
+	EpisodeNumFmt     string // number, name
+	SeriesLink        string
+	CollectionItems   string
+	ExternalLinks     string
+	PlayCollection    string
 
 	// People.
 	Person           string
@@ -187,34 +200,44 @@ type uiStrings struct {
 	SearchNoneFmt  string // query
 	SearchNoneBody string
 	SearchHint     string
+	SearchRecent   string
+	ClearHistory   string
 
 	// Favorites.
 	FavoritesEmpty     string
 	FavoritesEmptyBody string
 
 	// Settings.
-	Appearance   string
-	FollowSystem string
-	Light        string
-	Dark         string
-	Playback     string
-	MaxBitrate   string
-	Auto         string
-	SubtitleLang string
-	AudioLang    string
-	LangOff      string
-	AutoNext     string
-	AutoNextBody string
-	Cache        string
-	CacheSize    string
-	Measuring    string
-	ClearCache   string
-	CacheCleared string
-	About        string
-	AppVersion   string
-	ServerLabel  string
-	SignedInAs   string
-	DeviceLabel  string
+	Appearance          string
+	FollowSystem        string
+	Light               string
+	Dark                string
+	Playback            string
+	MaxBitrate          string
+	Auto                string
+	SubtitleLang        string
+	SubtitleSize        string
+	SubtitleSizeSmall   string
+	SubtitleSizeNormal  string
+	SubtitleSizeLarge   string
+	SubtitleSizeXL      string
+	AudioLang           string
+	LangOff             string
+	AutoNext            string
+	AutoNextBody        string
+	Cache               string
+	CacheSize           string
+	Measuring           string
+	ClearCache          string
+	CacheCleared        string
+	About               string
+	AppVersion          string
+	ServerLabel         string
+	SignedInAs          string
+	DeviceLabel         string
+	CredentialStore     string
+	CredentialKeychain  string
+	CredentialPlaintext string
 }
 
 // zhCN is the app's Chinese text.
@@ -347,6 +370,8 @@ var zhCN = uiStrings{
 	SortAdded:       "加入时间",
 	SortYear:        "年份",
 	SortRating:      "评分",
+	SortPlayed:      "最近播放",
+	SortRuntime:     "片长",
 	Ascending:       "升序",
 	Descending:      "降序",
 	FilterAll:       "全部",
@@ -358,22 +383,34 @@ var zhCN = uiStrings{
 	EmptyFilterBody: "换个筛选条件看看。",
 	EmptyFolder:     "这个文件夹是空的",
 	BoxSet:          "合集",
+	Genre:           "类型",
+	GenreEmpty:      "这个类型下还没有影片。",
 
-	Cast:             "演职人员",
-	Similar:          "相似推荐",
-	Version:          "版本",
-	Audio:            "音轨",
-	Subtitles:        "字幕",
-	SubtitlesOff:     "关闭",
-	Favorited:        "已收藏",
-	PlayedDone:       "已看完",
-	Directors:        "导演",
-	Studios:          "出品",
-	ResumeLeftFmt:    "继续播放 · 剩余 %s",
-	PlayEpisodeFmt:   "播放 %s",
-	ResumeEpisodeFmt: "继续播放 %s",
-	EpisodeNumFmt:    "%d. %s",
-	SeriesLink:       "前往剧集",
+	Cast:              "演职人员",
+	Similar:           "相似推荐",
+	Chapters:          "章节",
+	ChapterNumFmt:     "章节 %d",
+	Version:           "版本",
+	Audio:             "音轨",
+	Subtitles:         "字幕",
+	SubtitlesOff:      "关闭",
+	Favorited:         "已收藏",
+	PlayedDone:        "已看完",
+	ResetProgress:     "清除播放进度",
+	OpenExternal:      "外部播放器",
+	OpenWithFmt:       "用 %s 打开",
+	OpenedExternalFmt: "已在 %s 中打开",
+	ExternalFailedFmt: "启动外部播放器失败：%v",
+	Directors:         "导演",
+	Studios:           "出品",
+	ResumeLeftFmt:     "继续播放 · 剩余 %s",
+	PlayEpisodeFmt:    "播放 %s",
+	ResumeEpisodeFmt:  "继续播放 %s",
+	EpisodeNumFmt:     "%d. %s",
+	SeriesLink:        "前往剧集",
+	CollectionItems:   "收录内容",
+	ExternalLinks:     "外部链接",
+	PlayCollection:    "播放合集",
 
 	Person:           "人物",
 	BornFmt:          "生于 %s",
@@ -389,32 +426,42 @@ var zhCN = uiStrings{
 	SearchNoneFmt:  "没有找到“%s”",
 	SearchNoneBody: "换个关键词试试，片名、人名都可以。",
 	SearchHint:     "输入片名或人名开始搜索",
+	SearchRecent:   "最近搜索",
+	ClearHistory:   "清空",
 
 	FavoritesEmpty:     "还没有收藏",
 	FavoritesEmptyBody: "在卡片上右键选择“收藏”，喜欢的影片会出现在这里。",
 
-	Appearance:   "外观",
-	FollowSystem: "跟随系统",
-	Light:        "浅色",
-	Dark:         "深色",
-	Playback:     "播放",
-	MaxBitrate:   "最高码率",
-	Auto:         "自动",
-	SubtitleLang: "默认字幕语言",
-	AudioLang:    "默认音轨语言",
-	LangOff:      "不显示字幕",
-	AutoNext:     "自动播放下一集",
-	AutoNextBody: "一集播完后接着播放下一集。",
-	Cache:        "缓存",
-	CacheSize:    "图片缓存",
-	Measuring:    "正在计算…",
-	ClearCache:   "清理缓存",
-	CacheCleared: "图片缓存已清理",
-	About:        "关于",
-	AppVersion:   "版本",
-	ServerLabel:  "服务器",
-	SignedInAs:   "账户",
-	DeviceLabel:  "设备",
+	Appearance:          "外观",
+	FollowSystem:        "跟随系统",
+	Light:               "浅色",
+	Dark:                "深色",
+	Playback:            "播放",
+	MaxBitrate:          "最高码率",
+	Auto:                "自动",
+	SubtitleLang:        "默认字幕语言",
+	SubtitleSize:        "字幕字号",
+	SubtitleSizeSmall:   "小 (85%)",
+	SubtitleSizeNormal:  "标准 (100%)",
+	SubtitleSizeLarge:   "大 (120%)",
+	SubtitleSizeXL:      "特大 (145%)",
+	AudioLang:           "默认音轨语言",
+	LangOff:             "不显示字幕",
+	AutoNext:            "自动播放下一集",
+	AutoNextBody:        "一集播完后接着播放下一集。",
+	Cache:               "缓存",
+	CacheSize:           "图片缓存",
+	Measuring:           "正在计算…",
+	ClearCache:          "清理缓存",
+	CacheCleared:        "图片缓存已清理",
+	About:               "关于",
+	AppVersion:          "版本",
+	ServerLabel:         "服务器",
+	SignedInAs:          "账户",
+	DeviceLabel:         "设备",
+	CredentialStore:     "凭据存储",
+	CredentialKeychain:  "系统钥匙串（已加密）",
+	CredentialPlaintext: "本地配置文件（钥匙串不可用，令牌明文保存）",
 }
 
 // str is the language the app shows.

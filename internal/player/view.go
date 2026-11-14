@@ -29,11 +29,13 @@ import (
 //     a paused video asks for no frame at all.
 
 var (
-	white      = ui.RGB(255, 255, 255)
-	black      = ui.RGB(0, 0, 0)
-	textMuted  = ui.RGBA(255, 255, 255, 0.66)
-	trackColor = ui.RGBA(255, 255, 255, 0.28)
-	scrimTop   = ui.LinearGradient{From: ui.RGBA(0, 0, 0, 0.62), To: ui.Transparent, Angle: 180}
+	white            = ui.RGB(255, 255, 255)
+	black            = ui.RGB(0, 0, 0)
+	textMuted        = ui.RGBA(255, 255, 255, 0.66)
+	trackColor       = ui.RGBA(255, 255, 255, 0.28)
+	chapterTickColor = ui.RGBA(255, 255, 255, 0.58)
+	segmentBandColor = ui.RGBA(255, 196, 92, 0.52)
+	scrimTop         = ui.LinearGradient{From: ui.RGBA(0, 0, 0, 0.62), To: ui.Transparent, Angle: 180}
 	scrimBot   = ui.LinearGradient{From: ui.Transparent, To: ui.RGBA(0, 0, 0, 0.62), Angle: 180}
 	tnum       = []string{"tnum"}
 	barGlass   = glass.Glass{Tint: ui.RGBA(0, 0, 0, 0.32)}
@@ -128,6 +130,29 @@ func (p *Player) keys(c *ui.Context, now time.Time) {
 		if p.nextItem != nil {
 			p.playNext()
 		}
+	case c.Shortcut(0, ui.KeyBracketLeft):
+		p.activity = now
+		p.adjustSubOffset(-500 * time.Millisecond)
+	case c.Shortcut(0, ui.KeyBracketRight):
+		p.activity = now
+		p.adjustSubOffset(500 * time.Millisecond)
+	case c.Shortcut(0, ui.KeyBackslash):
+		p.activity = now
+		p.setSubOffset(0)
+	case c.Shortcut(0, ui.KeyI):
+		p.statsOpen = !p.statsOpen
+		if p.statsOpen {
+			p.refreshDiagnostics()
+		}
+	case c.Shortcut(0, ui.KeyC):
+		if len(p.chapters) > 0 {
+			p.activity = now
+			p.chapterOpen = !p.chapterOpen
+		}
+	case c.Shortcut(0, ui.KeyS):
+		if p.skipActiveSegment(now) {
+			p.activity = now
+		}
 	case c.Shortcut(0, ui.KeyEscape):
 		p.activity = now
 		p.escape()
@@ -183,6 +208,7 @@ func (p *Player) tick(c *ui.Context, now time.Time) {
 		pos = target
 		p.sendProgress(now, "TimeUpdate")
 		p.framePos = pos
+		p.syncNowPlayingPlayback()
 	} else if wait > 0 {
 		c.After(wait)
 	}
@@ -249,9 +275,6 @@ func (p *Player) firstPicture(now time.Time, pl *playing) {
 	pl.ready = true
 	if old := p.prev; old != nil {
 		p.prev = nil
-		if old.stream.Method == emby.Transcode && old.stream.Playback != nil && old.stream.Playback.PlaySessionID != pl.stream.Playback.PlaySessionID {
-			p.rep.send(reportJob{kind: reportStopTranscode, session: old.stream.Playback.PlaySessionID})
-		}
 		old.close()
 	}
 	eng.SetVolume(p.effectiveVolume())
@@ -270,6 +293,9 @@ func (p *Player) firstPicture(now time.Time, pl *playing) {
 		p.rep.send(reportJob{kind: reportStart, report: r})
 		p.lastSent = now
 	}
+	p.syncKeepAwake()
+	p.syncNowPlaying(now)
+	p.refreshDiagnostics()
 }
 
 func (p *Player) tickUpNext(pos, dur time.Duration) {
@@ -307,7 +333,7 @@ func (p *Player) wantControls(c *ui.Context, now time.Time) bool {
 	if p.phase != phasePlaying || pl == nil || !pl.ready || p.switching || p.prev != nil {
 		return true
 	}
-	if p.userPaused || p.scrubbing || p.speedOpen || p.audioOpen || p.subOpen || p.barHovered || pl.eng.Ended() {
+	if p.userPaused || p.scrubbing || p.speedOpen || p.audioOpen || p.subOpen || p.chapterOpen || p.barHovered || pl.eng.Ended() {
 		return true
 	}
 	until := p.activity.Add(controlsHideAfter)
@@ -359,7 +385,7 @@ func (p *Player) body(c *ui.Context, now time.Time, shown bool) {
 		}
 	}
 	if p.phase == phasePlaying && pl != nil && pl.ready && p.subs.active() {
-		if text := p.subs.at(p.framePos); text != "" {
+		if text := p.subs.at(p.framePos - p.subOffset); text != "" {
 			p.subtitle(c, text, w, h, shown)
 		}
 	}
@@ -378,16 +404,28 @@ func (p *Player) body(c *ui.Context, now time.Time, shown bool) {
 			return
 		}
 	}
+	if p.statsOpen && p.phase == phasePlaying && pl != nil {
+		p.diagnosticsHUD(c)
+	}
 	if showBar {
 		p.controlBar(c, now, w)
 	} else {
 		p.barHovered = false
 	}
-	if p.upNext.shown && !p.upNext.cancelled && p.nextItem != nil && p.phase == phasePlaying {
+	upNextShown := p.upNext.shown && !p.upNext.cancelled && p.nextItem != nil && p.phase == phasePlaying
+	if upNextShown {
 		p.upNextCard(c, now, showBar)
+	}
+	if p.phase == phasePlaying && pl != nil && pl.ready {
+		if segIdx, seg := p.activeSegment(p.framePos); seg != nil {
+			p.skipSegmentCard(c, now, segIdx, seg, showBar, upNextShown)
+		}
 	}
 	if p.phase == phaseError {
 		p.errorPanel(c, now)
+	}
+	if p.seek.pending && p.phase == phasePlaying && pl != nil {
+		c.After(max(p.seek.due.Sub(now), 0))
 	}
 }
 
@@ -430,7 +468,7 @@ func (p *Player) posterBitmap() *ui.Bitmap {
 // subtitle draws the line over the picture, above the controls when they
 // show, at a size following the window's height.
 func (p *Player) subtitle(c *ui.Context, text string, w, h float32, shown bool) {
-	size := min(max(h*0.042, 18), 46)
+	size := min(max(h*0.042, 18), 46) * float32(p.effectiveSubScale())
 	bottom := max(h*0.06, 28)
 	if shown && p.cur != nil {
 		bottom = 148
@@ -443,7 +481,7 @@ func (p *Player) subtitle(c *ui.Context, text string, w, h float32, shown bool) 
 	})
 }
 
-// topBar: back, and the title of what plays.
+// topBar: back, title of what plays, and diagnostics toggle.
 func (p *Player) topBar(c *ui.Context, withScrim bool) {
 	tb := c.TitleBar()
 	left := float32(20)
@@ -460,17 +498,33 @@ func (p *Player) topBar(c *ui.Context, withScrim bool) {
 			Radius(999).Material(barGlass).Draw(p.drawIcons[iconBackIdx])
 		if b.Clicked() {
 			p.exit(false)
-		}
-		if p.title == "" {
 			return
 		}
-		ui.Column(c).Gap(2).Shrink(1).PaddingY(1).Children(func() {
-			ui.Text(c, p.title).FontSize(17).FontWeight(600).TextColor(white).SingleLine().
-				TextShadow(0, 1, 3, ui.RGBA(0, 0, 0, 0.5))
-			if p.series != "" {
-				ui.Text(c, p.series).FontSize(13).TextColor(textMuted).SingleLine()
+		if p.title != "" {
+			ui.Column(c).Gap(2).Shrink(1).PaddingY(1).Children(func() {
+				ui.Text(c, p.title).FontSize(17).FontWeight(600).TextColor(white).SingleLine().
+					TextShadow(0, 1, 3, ui.RGBA(0, 0, 0, 0.5))
+				if p.series != "" {
+					ui.Text(c, p.series).FontSize(13).TextColor(textMuted).SingleLine()
+				}
+			})
+		}
+		if p.phase == phasePlaying && p.cur != nil {
+			ui.Spacer(c)
+			if p.cfg.OnOpenExternal != nil && p.item != nil {
+				extLabel := fmt.Sprintf(str.OpenExternalFmt, p.externalLabel())
+				if p.button(c, "top-external", iconExternalIdx, extLabel, 36).Clicked() {
+					p.openInExternal()
+					return
+				}
 			}
-		})
+			if p.button(c, "info", iconInfoIdx, str.Diagnostics, 36).Clicked() {
+				p.statsOpen = !p.statsOpen
+				if p.statsOpen {
+					p.refreshDiagnostics()
+				}
+			}
+		}
 	})
 }
 
@@ -560,11 +614,14 @@ func (p *Player) controlBar(c *ui.Context, now time.Time, w float32) {
 					p.setVolume(now, p.volValue)
 				}
 			}
+			if len(p.chapters) > 0 {
+				p.menuButton(c, "chapters", iconChaptersIdx, str.Chapters, p.fnChapterMenu, &p.chapterOpen)
+			}
 			p.menuButton(c, "speed", iconSpeedIdx, str.Speed, p.fnSpeedMenu, &p.speedOpen)
 			if len(p.audioTracks) > 1 {
 				p.menuButton(c, "audio", iconAudioIdx, str.Audio, p.fnAudioMenu, &p.audioOpen)
 			}
-			if len(p.subTracks) > 0 {
+			if len(p.subTracks) > 0 || p.canPickSubtitle() {
 				p.menuButton(c, "subtitles", iconSubtitlesIdx, str.Subtitles, p.fnSubMenu, &p.subOpen)
 			}
 			fs := str.FullScreen
@@ -593,12 +650,39 @@ func (p *Player) seekPreview(c *ui.Context, slider ui.Element, dur time.Duration
 		x = 8 + float32(float64(target)/float64(dur))*(width-16)
 	}
 	target = clampSeek(target, dur)
-	x = min(max(x, 40), max(width-40, 40))
-	ui.Text(c.Key("seek-preview"), p.seekText.at(target, false)).
+	thumbBmp, thumbSrc, thumbW, thumbH := p.previewThumbnail(target)
+	p.seekThumbShown = thumbBmp != nil
+	halfW := float32(40)
+	if thumbBmp != nil {
+		halfW = thumbW/2 + 10
+	}
+	x = min(max(x, halfW), max(width-halfW, halfW))
+	label := p.seekText.at(target, false)
+	if ci := p.chapterAt(target); ci >= 0 && p.chapters[ci].Name != "" {
+		label = p.chapters[ci].Name + " · " + label
+	}
+	p.seekPreviewText = label
+	if thumbBmp == nil {
+		ui.Text(c.Key("seek-preview"), label).
+			AttachTo(slider, ui.AnchorTopLeft, ui.AnchorBottom).Translate(x, -8).
+			Padding(5, 10).Radius(7).Background(ui.RGBA(18, 18, 20, 0.94)).
+			TextColor(white).FontSize(12).FontFeatures(tnum...).
+			Label(str.ProgressPreview).PassThrough()
+		return
+	}
+	ui.Column(c.Key("seek-preview")).
 		AttachTo(slider, ui.AnchorTopLeft, ui.AnchorBottom).Translate(x, -8).
-		Padding(5, 10).Radius(7).Background(ui.RGBA(18, 18, 20, 0.94)).
-		TextColor(white).FontSize(12).FontFeatures(tnum...).
-		Label(str.ProgressPreview).PassThrough()
+		Padding(6).Gap(5).Radius(10).Background(ui.RGBA(18, 18, 20, 0.94)).
+		AlignItems(ui.Center).Label(str.ProgressPreview).PassThrough().Children(func() {
+		ui.Box(c.Key("thumb")).Size(thumbW, thumbH).Radius(6).Clip().Draw(func(pt *ui.Painter, r ui.Rect) {
+			if thumbSrc.W > 0 {
+				pt.ImageRegion(thumbBmp, thumbSrc, r, ui.ImageOptions{})
+			} else {
+				pt.Image(thumbBmp, r, ui.Cover)
+			}
+		})
+		ui.Text(c, label).TextColor(white).FontSize(12).FontFeatures(tnum...).SingleLine()
+	})
 }
 
 // button is a round control showing icon, its face the theme's hover.
@@ -630,24 +714,120 @@ func (p *Player) audioMenu(m *ui.Menu) {
 	}
 }
 
+var (
+	subScales      = []float64{0.85, 1.0, 1.2, 1.45}
+	subScaleLabels = []string{str.SubtitleSizeSmall, str.SubtitleSizeNormal, str.SubtitleSizeLarge, str.SubtitleSizeXL}
+)
+
 func (p *Player) subtitleMenu(m *ui.Menu) {
 	if m.Item(str.SubtitlesOff).Radio(p.subIdx < 0).Chosen() {
 		p.selectSubtitle(-1)
 	}
-	m.Separator()
-	for i := range p.subTracks {
-		t := &p.subTracks[i]
-		it := m.Item(p.subLabels[i]).Radio(t.Index == p.subIdx)
-		local, localTrack := p.localSubtitle(t.Index)
-		if localTrack && local.Reason != "" {
-			it.Disabled(true).Subtitle(local.Reason)
-		} else if !t.IsText && !p.canBurnIn {
-			it.Disabled(true).Subtitle(str.BurnInUnavailable)
-		}
-		if it.Chosen() {
-			p.selectSubtitle(t.Index)
+	if len(p.subTracks) > 0 {
+		m.Separator()
+		for i := range p.subTracks {
+			t := &p.subTracks[i]
+			it := m.Item(p.subLabels[i]).Radio(t.Index == p.subIdx)
+			local, localTrack := p.localSubtitle(t.Index)
+			if localTrack && local.Reason != "" {
+				it.Disabled(true).Subtitle(local.Reason)
+			} else if !t.IsText && !p.canBurnIn {
+				it.Disabled(true).Subtitle(str.BurnInUnavailable)
+			}
+			if it.Chosen() {
+				p.selectSubtitle(t.Index)
+			}
 		}
 	}
+	m.Separator()
+	if p.hasUnburnableBitmapSubs() && p.cfg.OnOpenExternal != nil && p.item != nil {
+		if m.Item(fmt.Sprintf(str.OpenExternalSubFmt, p.externalLabel())).Chosen() {
+			p.openInExternal()
+			return
+		}
+	}
+	if p.canPickSubtitle() {
+		if m.Item(str.LoadLocalSubtitle).Chosen() {
+			p.loadLocalSubtitleFile()
+		}
+	}
+	delayLabel := str.SubtitleDelay
+	if p.subOffset != 0 {
+		delayLabel += " (" + formatSubOffset(p.subOffset) + ")"
+	}
+	m.Submenu(delayLabel, func(sm *ui.Menu) {
+		if sm.Item(str.SubtitleEarlier).Chosen() {
+			p.adjustSubOffset(-500 * time.Millisecond)
+		}
+		if sm.Item(str.SubtitleLater).Chosen() {
+			p.adjustSubOffset(500 * time.Millisecond)
+		}
+		sm.Separator()
+		if sm.Item(str.SubtitleResetDelay).Disabled(p.subOffset == 0).Chosen() {
+			p.setSubOffset(0)
+		}
+	}).ID("sub-delay")
+	m.Submenu(str.SubtitleSize, func(sm *ui.Menu) {
+		cur := p.effectiveSubScale()
+		for i, sc := range subScales {
+			if sm.Item(subScaleLabels[i]).Radio(math.Abs(cur-sc) < 0.01).Chosen() {
+				p.setSubScale(sc)
+			}
+		}
+	}).ID("sub-size")
+}
+
+func (p *Player) chapterMenu(m *ui.Menu) {
+	cur := p.chapterAt(p.framePos)
+	for i := range p.chapters {
+		ch := &p.chapters[i]
+		name := ch.Name
+		if name == "" {
+			name = fmt.Sprintf(str.ChapterFmt, i+1)
+		}
+		var ct clockText
+		if m.Item(name).Radio(cur == i).Trailing(ct.at(ch.Start(), false)).Chosen() {
+			p.seekTo(p.now, ch.Start())
+		}
+	}
+}
+
+func (p *Player) diagnosticsHUD(c *ui.Context) {
+	d := &p.diag
+	ui.Column(c.Key("diagnostics")).Absolute().Top(64).Left(24).Width(420).Padding(12, 16).Gap(6).
+		Radius(14).Material(panelGlass).PassThrough().Transition(fade).Children(func() {
+		p.diagRow(c, str.DiagMode, d.Pipeline)
+		if d.Container != "" {
+			p.diagRow(c, str.DiagContainer, d.Container)
+		}
+		if d.Video != "" || d.VideoRange != "" {
+			v := d.Video
+			if d.VideoRange != "" {
+				if v != "" {
+					v += " · " + d.VideoRange
+				} else {
+					v = d.VideoRange
+				}
+			}
+			p.diagRow(c, str.DiagVideo, v)
+		}
+		if d.Audio != "" {
+			p.diagRow(c, str.DiagAudio, d.Audio)
+		}
+		if d.Subtitle != "" {
+			p.diagRow(c, str.DiagSub, d.Subtitle)
+		}
+		if d.URL != "" {
+			p.diagRow(c, str.DiagURL, d.URL)
+		}
+	})
+}
+
+func (p *Player) diagRow(c *ui.Context, label, value string) {
+	ui.Row(c.Key(label)).Gap(10).AlignItems(ui.Start).Children(func() {
+		ui.Text(c, label).FontSize(12).TextColor(textMuted).Width(84).Shrink(0)
+		ui.Text(c, value).FontSize(12).TextColor(white).FontFeatures(tnum...).Grow(1).Shrink(1).MinWidth(0).MaxLines(2)
+	})
 }
 
 var speedLabels = func() []string {
@@ -687,6 +867,33 @@ func (p *Player) upNextCard(c *ui.Context, now time.Time, barShown bool) {
 	})
 }
 
+// skipSegmentCard prompts to skip an active intro, recap, or credits segment.
+func (p *Player) skipSegmentCard(c *ui.Context, now time.Time, segIdx int, seg *emby.MediaSegment, barShown, upNextShown bool) {
+	bottom := float32(28)
+	switch {
+	case upNextShown && barShown:
+		bottom = 260
+	case upNextShown:
+		bottom = 160
+	case barShown:
+		bottom = 132
+	}
+	label := segmentSkipLabel(seg.Type)
+	ui.Row(c.Key("skip-segment")).Absolute().Right(28).Bottom(bottom).Padding(8, 10).Gap(8).
+		Radius(999).Material(panelGlass).AlignItems(ui.Center).KeepFocus().Transition(moveSmoothly).Children(func() {
+		if ui.Button(c.Key("skip-do"), label).Background(white).TextColor(black).
+			Radius(999).Padding(6, 16).Clicked() {
+			p.activity = now
+			p.skipActiveSegment(now)
+			return
+		}
+		if ui.Button(c.Key("skip-dismiss"), str.Dismiss).Background(ui.RGBA(255, 255, 255, 0.14)).
+			Radius(999).Padding(6, 12).Clicked() {
+			p.dismissedSeg = segIdx
+		}
+	})
+}
+
 // errorPanel says why nothing plays, with a way out: never a black screen.
 func (p *Player) errorPanel(c *ui.Context, now time.Time) {
 	fillAbs(ui.Column(c.Key("error"))).Center().Children(func() {
@@ -700,6 +907,13 @@ func (p *Player) errorPanel(c *ui.Context, now time.Time) {
 					if ui.Button(c.Key("retry"), str.Retry).Background(ui.RGBA(255, 255, 255, 0.14)).
 						Radius(999).Padding(7, 18).Clicked() {
 						p.retry()
+						return
+					}
+				}
+				if p.cfg.OnOpenExternal != nil && p.item != nil {
+					if ui.Button(c.Key("external"), fmt.Sprintf(str.OpenExternalFmt, p.externalLabel())).
+						Background(ui.RGBA(255, 255, 255, 0.14)).Radius(999).Padding(7, 18).Clicked() {
+						p.openInExternal()
 						return
 					}
 				}
@@ -724,6 +938,9 @@ const (
 	iconSpeedIdx
 	iconAudioIdx
 	iconSubtitlesIdx
+	iconChaptersIdx
+	iconInfoIdx
+	iconExternalIdx
 	iconFullscreenIdx
 	iconCount
 )
@@ -759,6 +976,9 @@ func (p *Player) makeDrawers() {
 	p.drawIcons[iconSpeedIdx] = fixed(iconSpeed, 21)
 	p.drawIcons[iconAudioIdx] = fixed(iconAudioTrack, 21)
 	p.drawIcons[iconSubtitlesIdx] = fixed(iconSubtitles, 21)
+	p.drawIcons[iconChaptersIdx] = fixed(iconChapters, 20)
+	p.drawIcons[iconInfoIdx] = fixed(iconInfo, 19)
+	p.drawIcons[iconExternalIdx] = fixed(iconExternal, 18)
 	p.drawIcons[iconFullscreenIdx] = func(pt *ui.Painter, r ui.Rect) {
 		s := iconFullscreen
 		if p.fullscreen {
@@ -783,8 +1003,32 @@ func (p *Player) drawProgress(pt *ui.Painter, r ui.Rect) {
 	x, w := r.X+pad, r.W-2*pad
 	y := r.Y + r.H/2
 	pt.Fill(ui.Rect{X: x, Y: y - th/2, W: w, H: th}, trackColor, th/2)
+	if dur := p.effectiveDur(); len(p.segments) > 0 && dur > 0 {
+		durSec := dur.Seconds()
+		for i := range p.segments {
+			s0 := max(p.segments[i].Start().Seconds(), 0)
+			s1 := min(p.segments[i].End().Seconds(), durSec)
+			if s1 <= s0 || s0 >= durSec {
+				continue
+			}
+			sx := x + w*float32(s0/durSec)
+			sw := max(w*float32((s1-s0)/durSec), 2)
+			pt.Fill(ui.Rect{X: sx, Y: y - th/2, W: sw, H: th}, segmentBandColor, th/2)
+		}
+	}
 	done := w * p.barFrac
 	pt.Fill(ui.Rect{X: x, Y: y - th/2, W: done, H: th}, white, th/2)
+	if dur := p.effectiveDur(); len(p.chapters) > 0 && dur > 0 {
+		durSec := dur.Seconds()
+		for i := range p.chapters {
+			s := p.chapters[i].Start().Seconds()
+			if s <= 0 || s >= durSec {
+				continue
+			}
+			cx := x + w*float32(s/durSec)
+			pt.Fill(ui.Rect{X: cx - 1, Y: y - th/2, W: 2, H: th}, chapterTickColor, 0)
+		}
+	}
 	pt.Fill(ui.Rect{X: x + done - knob/2, Y: y - knob/2, W: knob, H: knob}, white, knob/2)
 }
 

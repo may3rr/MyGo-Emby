@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"math"
 	"slices"
 
 	"github.com/egoist/mygo/ui"
@@ -26,6 +27,12 @@ var (
 	languageChoices = []choice[string]{
 		{str.Auto, ""}, {"中文", "chi"}, {"粤语", "yue"}, {"英语", "eng"}, {"日语", "jpn"}, {"韩语", "kor"},
 		{"法语", "fre"}, {"德语", "ger"}, {"西班牙语", "spa"},
+	}
+	subScaleChoices = []choice[float64]{
+		{str.SubtitleSizeNormal, 0},
+		{str.SubtitleSizeSmall, 0.85},
+		{str.SubtitleSizeLarge, 1.2},
+		{str.SubtitleSizeXL, 1.45},
 	}
 	themeChoices = []string{themeSystem, themeLight, themeDark}
 )
@@ -63,11 +70,19 @@ type settingsForm struct {
 	theme     int
 	bitrate   string
 	subtitles string
+	subScale  string
 	audio     string
 	autoNext  bool
 
 	cacheBytes int64 // -1 while it is measured
 	measured   bool
+}
+
+func normalizeSubtitleScale(v float64) float64 {
+	if v <= 0 || math.Abs(v-1) < 0.01 {
+		return 0
+	}
+	return v
 }
 
 // syncForm takes the values from the settings, as the page first shows.
@@ -78,6 +93,7 @@ func (a *app) syncForm() {
 	f.bitrate = labelOf(bitrateChoices, s.MaxBitrate)
 	subs := append([]choice[string]{{str.LangOff, "off"}}, languageChoices...)
 	f.subtitles = labelOf(subs, s.SubtitleLang)
+	f.subScale = labelOf(subScaleChoices, normalizeSubtitleScale(s.SubtitleScale))
 	f.audio = labelOf(languageChoices, s.AudioLang)
 	f.autoNext = s.AutoPlayNext
 	f.shown = true
@@ -160,6 +176,16 @@ func (a *app) settingsPage(c *ui.Context, r *ui.Route) {
 					}
 				})
 				a.settingsSeparator(c)
+				a.settingsRow(c, str.SubtitleSize, "", func() {
+					if ui.Select(c.Key("sub-scale"), &f.subScale, labels(subScaleChoices)).Label(str.SubtitleSize).Changed() {
+						a.settings.SubtitleScale = valueOf(subScaleChoices, f.subScale)
+						a.saveSettings()
+						if a.player != nil {
+							a.player.SetSubtitleScale(a.settings.SubtitleScale)
+						}
+					}
+				})
+				a.settingsSeparator(c)
 				a.settingsRow(c, str.AudioLang, "", func() {
 					if ui.Select(c.Key("audio"), &f.audio, labels(languageChoices)).Label(str.AudioLang).Changed() {
 						a.settings.AudioLang = valueOf(languageChoices, f.audio)
@@ -195,6 +221,12 @@ func (a *app) settingsPage(c *ui.Context, r *ui.Route) {
 				}
 				a.settingsSeparator(c)
 				a.settingsFact(c, str.DeviceLabel, a.device.Device)
+				a.settingsSeparator(c)
+				credStatus := str.CredentialKeychain
+				if a.plainTokens {
+					credStatus = str.CredentialPlaintext
+				}
+				a.settingsFact(c, str.CredentialStore, credStatus)
 			})
 		})
 	})

@@ -17,6 +17,8 @@ import (
 // settings' languages.
 type playOptions struct {
 	FromStart     bool
+	StartAt       time.Duration
+	HasStartAt    bool
 	MediaSourceID string
 	AudioIndex    *int
 	// SubtitleIndex is the subtitle stream to show; -1 shows none.
@@ -44,8 +46,11 @@ func (a *app) play(it *emby.Item, o playOptions) {
 		return
 	}
 	a.accountOpen = false
+	p.SetSubtitleScale(a.settings.SubtitleScale)
 	p.PlayWith(it, player.Options{
 		FromStart:     o.FromStart,
+		StartAt:       o.StartAt,
+		HasStartAt:    o.HasStartAt,
 		MediaSourceID: o.MediaSourceID,
 		AudioIndex:    o.AudioIndex,
 		SubtitleIndex: o.SubtitleIndex,
@@ -71,19 +76,29 @@ func (a *app) ensurePlayer() *player.Player {
 		src.Fallback = player.RemuxFallback(a.remuxer)
 	}
 	s := a.settings
-	a.player = player.New(player.Config{
-		Client:       a.client,
-		Window:       a.win,
-		Post:         a.update,
-		MaxBitrate:   int64(s.MaxBitrate),
-		AudioLang:    s.AudioLang,
-		SubtitleLang: s.SubtitleLang,
-		AutoNext:     s.AutoPlayNext,
-		Volume:       s.Volume,
-		Image:        a.img.Get,
-		Source:       src,
-		OnExit:       a.playerExited,
-	})
+	cfg := player.Config{
+		Client:        a.client,
+		Window:        a.win,
+		Post:          a.update,
+		MaxBitrate:    int64(s.MaxBitrate),
+		AudioLang:     s.AudioLang,
+		SubtitleLang:  s.SubtitleLang,
+		SubtitleScale: s.SubtitleScale,
+		AutoNext:      s.AutoPlayNext,
+		Volume:        s.Volume,
+		Image:         a.img.Get,
+		Source:        src,
+		OnExit:        a.playerExited,
+	}
+	if len(a.extPlayers) > 0 {
+		cfg.ExternalPlayerLabel = a.extPlayers[0].Name
+		cfg.OnOpenExternal = func(it *emby.Item, msID string, pos time.Duration) {
+			if len(a.extPlayers) > 0 {
+				a.openExternal(a.extPlayers[0], it, msID, pos)
+			}
+		}
+	}
+	a.player = player.New(cfg)
 	return a.player
 }
 
@@ -91,8 +106,11 @@ func (a *app) ensurePlayer() *player.Player {
 // user left is kept, and the pages load again what playing changed (the
 // resume points, what is next, what is watched).
 func (a *app) playerExited(r player.Result) {
-	if r.Volume != a.settings.Volume {
+	scale := normalizeSubtitleScale(r.SubtitleScale)
+	if r.Volume != a.settings.Volume || scale != a.settings.SubtitleScale {
 		a.settings.Volume = r.Volume
+		a.settings.SubtitleScale = scale
+		a.form.subScale = labelOf(subScaleChoices, scale)
 		a.saveSettings()
 	}
 	a.refresh()

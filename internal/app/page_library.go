@@ -25,6 +25,8 @@ const (
 	sortAdded
 	sortYear
 	sortRating
+	sortPlayed
+	sortRuntime
 )
 
 const (
@@ -42,13 +44,13 @@ type libPrefs struct {
 
 // sortLabels and filterLabels name the choices, in their order.
 func sortLabels() []string {
-	return []string{str.SortName, str.SortAdded, str.SortYear, str.SortRating}
+	return []string{str.SortName, str.SortAdded, str.SortYear, str.SortRating, str.SortPlayed, str.SortRuntime}
 }
 func filterLabels() []string { return []string{str.FilterAll, str.FilterUnplayed, str.FilterFavorites} }
 
 // sortKeys and filterKeys name the choices in the settings, in their order.
 var (
-	sortKeys   = []string{"name", "added", "year", "rating"}
+	sortKeys   = []string{"name", "added", "year", "rating", "played", "runtime"}
 	filterKeys = []string{"all", "unplayed", "favorites"}
 )
 
@@ -124,6 +126,10 @@ func libraryQuery(lib library, folderID string, p libPrefs, start, limit int) em
 		q.SortBy = []string{emby.SortProductionYear, emby.SortPremiereDate, emby.SortName}
 	case sortRating:
 		q.SortBy = []string{emby.SortCommunityRating, emby.SortName}
+	case sortPlayed:
+		q.SortBy = []string{emby.SortDatePlayed, emby.SortName}
+	case sortRuntime:
+		q.SortBy = []string{emby.SortRuntime, emby.SortName}
 	default:
 		q.SortBy = []string{emby.SortName}
 	}

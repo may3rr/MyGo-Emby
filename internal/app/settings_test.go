@@ -77,6 +77,68 @@ func TestSettingsWithoutSidebarPreferenceStayExpanded(t *testing.T) {
 	}
 }
 
+// Use a store without its background writer to make failed writes deterministic.
+func TestSettingsFlushRetriesFailedWrite(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "blocked")
+	if err := os.WriteFile(parent, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	st := &settingsStore{path: filepath.Join(parent, "settings.json"), wake: make(chan struct{}, 1)}
+	s := defaultSettings()
+	s.ThemeMode = themeDark
+	st.Save(s)
+	if err := st.Flush(); err == nil {
+		t.Fatal("saving through a file should fail")
+	}
+	if err := st.Flush(); err == nil {
+		t.Fatal("a failed save must not become a successful no-op")
+	}
+	if err := os.Remove(parent); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(st.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Settings
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, s) {
+		t.Fatalf("retried settings = %+v, want %+v", got, s)
+	}
+}
+
+func TestSettingsNewSaveReplacesFailedWrite(t *testing.T) {
+	st := &settingsStore{path: filepath.Join(t.TempDir(), "settings.json"), wake: make(chan struct{}, 1)}
+	s := defaultSettings()
+	s.Session = json.RawMessage(`invalid JSON`)
+	st.Save(s)
+	if err := st.Flush(); err == nil {
+		t.Fatal("invalid JSON should fail to marshal")
+	}
+	s.Session = nil
+	s.ThemeMode = themeLight
+	st.Save(s)
+	if err := st.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(st.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got Settings
+	if err := json.Unmarshal(data, &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, s) {
+		t.Fatalf("saved settings = %+v, want latest %+v", got, s)
+	}
+}
+
 func TestSettingsWithoutPathKeepNothing(t *testing.T) {
 	st, s := openSettings("")
 	st.Save(s)

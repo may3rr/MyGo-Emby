@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"time"
 
 	"mygo-emby/internal/emby"
@@ -37,6 +38,9 @@ type Request struct {
 	// AudioIndex is the audio track to play; nil plays the source's
 	// default one.
 	AudioIndex *int
+	// SubtitleIndex is a client-rendered selection. It binds the request
+	// to one version just like AudioIndex; it is not sent for burn-in.
+	SubtitleIndex *int
 	// BurnIn is a bitmap subtitle to burn into the picture (only a server
 	// transcode can); nil for none. Text subtitles are the player's own.
 	BurnIn *int
@@ -52,6 +56,10 @@ type Stream struct {
 	// Method is reported to the server: DirectPlay for the file, also
 	// when this machine remuxes it, Transcode for the server's HLS.
 	Method emby.PlayMethod
+	// Pipeline describes the actual playback path in human terms (e.g.
+	// AVPlayer direct play, local pure-Go remux, local remux + FFmpeg
+	// audio, or server HLS transcode).
+	Pipeline string
 	// Playback is the server's answer, for the reports and the track
 	// lists.
 	Playback *emby.Playback
@@ -78,6 +86,9 @@ type Stream struct {
 	// The player calls it once, on the main thread, after closing
 	// AVPlayer; it must not block.
 	Close func()
+	// releaseServer relinquishes this stream's share of a server transcode.
+	// Kept separate from Close so stopped reports can precede server cleanup.
+	releaseServer func()
 }
 
 // localSubtitle is a subtitle enumerated by a local source. ID is an
@@ -128,11 +139,26 @@ func (s *Stream) localSubtitle(index int) (localSubtitle, bool) {
 }
 
 func (s *Stream) close() {
-	if s != nil && s.Close != nil {
+	if s == nil {
+		return
+	}
+	if s.Close != nil {
 		f := s.Close
 		s.Close = nil
 		f()
 	}
+	if release := s.takeServerRelease(); release != nil {
+		release()
+	}
+}
+
+func (s *Stream) takeServerRelease() func() {
+	if s == nil {
+		return nil
+	}
+	release := s.releaseServer
+	s.releaseServer = nil
+	return release
 }
 
 // ErrUnplayable is what errors.Is finds in an *UnplayableError.
@@ -141,13 +167,23 @@ var ErrUnplayable = errors.New("player: not playable")
 // UnplayableError says why an item cannot play here, in words for the user.
 type UnplayableError struct {
 	Reason string
+	// Err is the underlying remux or server failure. Error keeps it for
+	// logs and diagnostics while errorText can show the stable Reason.
+	Err error
 	// AudioUnavailable and BurnInUnavailable tell that the item plays,
 	// but not with the audio track or burned-in subtitle asked for, which
 	// the player then drops.
 	AudioUnavailable, BurnInUnavailable bool
 }
 
-func (e *UnplayableError) Error() string        { return e.Reason }
+func (e *UnplayableError) Error() string {
+	if e.Err == nil {
+		return e.Reason
+	}
+	return e.Reason + ": " + e.Err.Error()
+}
+
+func (e *UnplayableError) Unwrap() error        { return e.Err }
 func (e *UnplayableError) Is(target error) bool { return target == ErrUnplayable }
 
 // ServerSource opens what the server offers: the file when AVPlayer reads
@@ -166,28 +202,107 @@ func (s *ServerSource) Open(ctx context.Context, r Request) (*Stream, error) {
 		return nil, &UnplayableError{Reason: str.ErrNoStream}
 	}
 	p, err := s.Client.PlaybackInfo(ctx, r.Item.ID, s.options(r, false))
-	if err != nil {
+	if err != nil && (p == nil || !errors.Is(err, emby.ErrNotPlayable)) {
 		if errors.Is(err, emby.ErrNotPlayable) {
 			return nil, &UnplayableError{Reason: str.ErrNoStream}
 		}
 		return nil, err
 	}
+	// Track indexes belong to one version. Without a version ID, an
+	// explicit audio/subtitle choice still rules out switching versions.
+	auto := r.MediaSourceID == "" && r.AudioIndex == nil &&
+		(r.SubtitleIndex == nil || *r.SubtitleIndex < 0) && (r.BurnIn == nil || *r.BurnIn < 0)
+	candidates := p.MediaSources
+	tried := map[string]bool{p.MediaSourceID: true, p.Source.ID: true}
+	var stream *Stream
+	var firstErr error
+	if err != nil {
+		firstErr = &UnplayableError{Reason: str.ErrNoStream, Err: err}
+	} else {
+		stream, firstErr = s.openOne(ctx, p, r)
+	}
+	if firstErr == nil || !auto || !playabilityFailure(firstErr) {
+		return stream, firstErr
+	}
+	// Only the original, finite list is traversed. Each version needs its
+	// own PlaybackInfo: URLs, tracks and play-session IDs are not reusable.
+	for _, candidate := range candidates {
+		if candidate.ID == "" || tried[candidate.ID] {
+			continue
+		}
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		tried[candidate.ID] = true
+		next := r
+		next.MediaSourceID = candidate.ID
+		pb, err := s.Client.PlaybackInfo(ctx, r.Item.ID, s.options(next, false))
+		if err == nil {
+			stream, err = s.openOne(ctx, pb, next)
+			if err == nil {
+				return stream, nil
+			}
+		}
+		if !playabilityFailure(err) {
+			return nil, err
+		}
+	}
+	return nil, firstErr
+}
+
+// requestFailure takes precedence even when wrapped with a local format
+// error. Retrying another version cannot repair a failed request.
+func requestFailure(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var network net.Error
+	if errors.As(err, &network) {
+		return true
+	}
+	if api, ok := err.(*emby.Error); ok && api.Kind != emby.KindNotPlayable {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, cause := range joined.Unwrap() {
+			if requestFailure(cause) {
+				return true
+			}
+		}
+	}
+	if cause := errors.Unwrap(err); cause != nil {
+		return requestFailure(cause)
+	}
+	return false
+}
+
+func playabilityFailure(err error) bool {
+	return !requestFailure(err) && (errors.Is(err, ErrUnplayable) || errors.Is(err, emby.ErrNotPlayable))
+}
+
+// openOne exhausts the playback paths for one version before another
+// version may be considered. Transcode requests stay on this version.
+func (s *ServerSource) openOne(ctx context.Context, p *emby.Playback, r Request) (*Stream, error) {
+	r.MediaSourceID = p.MediaSourceID
 	audioOK := r.AudioIndex == nil || *r.AudioIndex == nativeAudio(&p.Source)
 	burn := r.BurnIn != nil && *r.BurnIn >= 0
 	switch {
 	case p.Method == emby.Transcode:
 		return serverStream(p, r), nil
 	case p.NativelyPlayable && audioOK && !burn:
-		return &Stream{URL: p.StreamURL, Method: p.Method, Playback: p, AudioIndex: nativeAudio(&p.Source), BurnedIn: -1}, nil
+		return &Stream{URL: p.StreamURL, Method: p.Method, Pipeline: str.PipeDirect, Playback: p, AudioIndex: nativeAudio(&p.Source), BurnedIn: -1}, nil
 	case !burn && s.Fallback != nil:
 		stream, localErr := s.Fallback(ctx, p, r)
 		if localErr == nil {
 			return stream, nil
 		}
+		if requestFailure(localErr) {
+			return nil, localErr
+		}
 		if p.Source.SupportsTranscoding {
 			pt, err := s.Client.PlaybackInfo(ctx, r.Item.ID, s.options(r, true))
 			if err != nil {
-				return nil, fmt.Errorf("%w; server transcode also failed: %v", localErr, err)
+				return nil, fmt.Errorf("%w; server transcode also failed: %w", localErr, err)
 			}
 			if pt.Method == emby.Transcode {
 				return serverStream(pt, r), nil
@@ -237,7 +352,7 @@ func serverStream(p *emby.Playback, r Request) *Stream {
 	if r.BurnIn != nil && *r.BurnIn >= 0 {
 		burned = *r.BurnIn
 	}
-	return &Stream{URL: p.StreamURL, Method: emby.Transcode, Playback: p, AudioIndex: p.AudioStreamIndex,
+	return &Stream{URL: p.StreamURL, Method: emby.Transcode, Pipeline: str.PipeServerTranscode, Playback: p, AudioIndex: p.AudioStreamIndex,
 		BurnedIn: burned, ServerWork: true, Playlist: p.IsHLS}
 }
 

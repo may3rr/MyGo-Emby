@@ -8,6 +8,10 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"os"
+	"path/filepath"
+	"slices"
+	"sort"
 	"sync"
 	"time"
 
@@ -32,6 +36,8 @@ type Config struct {
 	// codes ("chi", "zh", "eng"…); "" keeps the server's default, and
 	// SubtitleLang SubtitlesOff shows none.
 	AudioLang, SubtitleLang string
+	// SubtitleScale scales rendered subtitle text (<=0 uses 1.0).
+	SubtitleScale float64
 	// AutoNext plays the next episode when one ends, after a countdown.
 	AutoNext bool
 	// Volume, from 0 to 1, and Muted are how the sound starts.
@@ -40,6 +46,13 @@ type Config struct {
 	// OnExit runs on the main thread when the user leaves the player, or
 	// an item played to its end with nothing after it.
 	OnExit func(Result)
+	// PickSubtitleFile picks a local subtitle file path; nil uses
+	// mygo.Dialog.Open when Window is non-nil.
+	PickSubtitleFile func() (string, error)
+	// ExternalPlayerLabel and OnOpenExternal offer a fallback button on the
+	// error panel to open the item in an external player.
+	ExternalPlayerLabel string
+	OnOpenExternal      func(item *emby.Item, mediaSourceID string, pos time.Duration)
 
 	// Image, when set, returns the picture at a URL, nil while it loads,
 	// asking for a frame when it comes (the app's image cache). Without
@@ -57,9 +70,10 @@ type Result struct {
 	Position time.Duration
 	// Finished: the item played to its end (or nearly), which the server
 	// marks played.
-	Finished bool
-	Volume   float64
-	Muted    bool
+	Finished      bool
+	Volume        float64
+	Muted         bool
+	SubtitleScale float64
 }
 
 type phase uint8
@@ -133,9 +147,11 @@ type Player struct {
 	post func(func())
 	http *http.Client
 	// What the player asks of the server, which tests replace.
-	reportTo    reportClient
-	nextEpisode func(ctx context.Context, it *emby.Item) (*emby.Item, error)
-	fetchSubs   func(ctx context.Context, url string) (*emby.Subtitles, error)
+	reportTo        reportClient
+	nextEpisode     func(ctx context.Context, it *emby.Item) (*emby.Item, error)
+	fetchSubs       func(ctx context.Context, url string) (*emby.Subtitles, error)
+	fetchSegments   func(ctx context.Context, itemID string) ([]emby.MediaSegment, error)
+	fetchTrickSheet func(ctx context.Context, itemID, mediaSourceID string, width, sheetIndex int) ([]byte, error)
 
 	theme *ui.Theme
 	focus ui.Handle
@@ -143,16 +159,18 @@ type Player struct {
 	active bool
 	// gen tells sessions (items) apart, sgen streams within one: answers
 	// of an older one are dropped.
-	gen, sgen uint64
-	cancel    context.CancelFunc
-	ctx       context.Context
-	reports   sync.WaitGroup
-	rep       *reporter
-	started   bool
-	lastSent  time.Time
-	finished  bool
+	gen, sgen  uint64
+	cancel     context.CancelFunc
+	ctx        context.Context
+	reports    sync.WaitGroup
+	rep        *reporter
+	transcodes *transcodeSessions
+	started    bool
+	lastSent   time.Time
+	finished   bool
 
 	item              *emby.Item
+	mediaSourceID     string // final version, also retained after engine failure
 	title, series     string
 	posterURL         string
 	poster            *ui.Bitmap
@@ -170,11 +188,25 @@ type Player struct {
 	subTracks         []emby.Track
 	audioLabels       []string
 	subLabels         []string
-	localSubs         map[int]localSubtitle
-	audioIdx, subIdx  int
+	localSubs          map[int]localSubtitle
+	userSubs           map[int]*emby.Subtitles
+	chapters           []emby.Chapter
+	segments           []emby.MediaSegment
+	segmentsFromServer bool
+	dismissedSeg       int
+	trickSheets        map[trickSheetKey]*ui.Bitmap
+	trickOrder         []trickSheetKey
+	trickPending       map[trickSheetKey]bool
+	trickFailed        map[trickSheetKey]bool
+	chapThumbs         map[string]*ui.Bitmap
+	chapPending        map[string]bool
+	seekThumbShown     bool
+	audioIdx, subIdx   int
 	canBurnIn         bool
 	subs              subtitleTrack
 	subGen            uint64
+	subOffset         time.Duration
+	subScale          float64
 	nextItem          *emby.Item
 	nextTitle         string
 	upNext            upNextState
@@ -185,24 +217,32 @@ type Player struct {
 	seek              seeker
 	posText, remText  clockText
 	seekText          clockText
+	seekPreviewText   string
 	upNextText        string
 	upNextSecs        int
 	fullscreen        bool
 	enteredFullscreen bool
 
 	// The view's state.
-	activity                      time.Time
-	controlsShown                 bool
-	barHovered                    bool
-	scrubbing                     bool
-	scrub, volValue               float64
-	speedOpen, audioOpen, subOpen bool
+	activity                                   time.Time
+	controlsShown                              bool
+	barHovered                                 bool
+	scrubbing                                  bool
+	scrub, volValue                            float64
+	speedOpen, audioOpen, subOpen, chapterOpen bool
+	statsOpen                                  bool
+	diag                                       DiagnosticsInfo
+
+	// OS media integration handles (when Window != nil).
+	awakeRelease func()
+	mediaCmdOff  func()
 
 	// Functions made once, so that building the view allocates none.
 	fnInput        func(ui.InputEvent) bool
 	fnSpeedMenu    func(*ui.Menu)
 	fnAudioMenu    func(*ui.Menu)
 	fnSubMenu      func(*ui.Menu)
+	fnChapterMenu  func(*ui.Menu)
 	fnDrawProgress func(*ui.Painter, ui.Rect)
 	fnDrawVolume   func(*ui.Painter, ui.Rect)
 	drawIcons      [iconCount]func(*ui.Painter, ui.Rect)
@@ -247,12 +287,15 @@ func New(cfg Config) *Player {
 	p.http = &http.Client{Timeout: 20 * time.Second}
 	if c := cfg.Client; c != nil {
 		p.reportTo, p.nextEpisode, p.fetchSubs = c, c.NextEpisode, c.FetchSubtitles
+		p.fetchSegments, p.fetchTrickSheet = c.MediaSegments, c.FetchTrickplaySheet
 	}
 	p.theme = playerTheme()
+	p.subScale = clampSubScale(cfg.SubtitleScale)
 	p.fnInput = p.onInput
 	p.fnSpeedMenu = p.speedMenu
 	p.fnAudioMenu = p.audioMenu
 	p.fnSubMenu = p.subtitleMenu
+	p.fnChapterMenu = p.chapterMenu
 	p.fnDrawProgress = p.drawProgress
 	p.fnDrawVolume = p.drawVolume
 	p.makeDrawers()
@@ -260,6 +303,7 @@ func New(cfg Config) *Player {
 		p.fullscreen = w.IsFullScreen()
 		w.OnEnterFullScreen(func() { p.fullscreen = true; w.Invalidate() })
 		w.OnLeaveFullScreen(func() { p.fullscreen = false; p.enteredFullscreen = false; w.Invalidate() })
+		p.ensureMediaCommands()
 	}
 	return p
 }
@@ -277,7 +321,9 @@ func (p *Player) Play(it *emby.Item, fromStart bool) {
 // Options say how to play an item, as its page chose. Those left nil or
 // "" are the player's to choose, by the languages of Config.
 type Options struct {
-	FromStart bool
+	FromStart  bool
+	StartAt    time.Duration
+	HasStartAt bool
 	// MediaSourceID chooses a version; "" lets the server choose.
 	MediaSourceID string
 	// AudioIndex and SubtitleIndex are Emby stream indexes; a
@@ -289,7 +335,10 @@ type Options struct {
 // item only: the next episode picks its tracks by language again.
 func (p *Player) PlayWith(it *emby.Item, o Options) {
 	start := time.Duration(0)
-	if !o.FromStart && it != nil {
+	switch {
+	case o.HasStartAt:
+		start = max(o.StartAt, 0)
+	case !o.FromStart && it != nil:
 		start = it.ResumePosition()
 	}
 	p.want = o
@@ -302,27 +351,40 @@ func (p *Player) PlayWith(it *emby.Item, o Options) {
 func (p *Player) begin(it *emby.Item, start time.Duration, st *Stream) {
 	p.endSession(false)
 	p.active = true
+	p.ensureMediaCommands()
 	p.gen++
 	p.ctx, p.cancel = context.WithCancel(context.Background())
 	p.item = it
+	p.mediaSourceID = p.want.MediaSourceID
 	p.startAt = start
 	p.lastPos = start
 	p.runtime = 0
+	p.chapters = nil
+	p.resetSegmentsAndTrickplay()
 	if it != nil {
 		p.runtime = it.Runtime()
+		if len(it.Chapters) > 0 {
+			p.chapters = slices.Clone(it.Chapters)
+			sort.SliceStable(p.chapters, func(i, j int) bool {
+				return p.chapters[i].StartPositionTicks < p.chapters[j].StartPositionTicks
+			})
+			p.segments = emby.SegmentsFromChapters(p.chapters, p.runtime)
+		}
 	}
 	p.title, p.series = titles(it)
 	p.phase, p.errText, p.errRetry = phaseLoading, "", false
 	p.started, p.finished, p.lastSent = false, false, time.Time{}
 	p.userPaused = false
 	p.audioTracks, p.subTracks, p.audioLabels, p.subLabels = nil, nil, nil, nil
-	p.localSubs = nil
+	p.localSubs, p.userSubs = nil, nil
 	p.audioIdx, p.subIdx, p.canBurnIn = -1, -1, false
+	p.subOffset = 0
 	p.subs.reset()
 	p.nextItem, p.upNext, p.upNextFrozen = nil, upNextState{}, false
 	p.seek.reset()
 	p.scrubbing = false
-	p.speedOpen, p.audioOpen, p.subOpen = false, false, false
+	p.speedOpen, p.audioOpen, p.subOpen, p.chapterOpen = false, false, false, false
+	p.diag = DiagnosticsInfo{}
 	p.activity = p.now // the controls show as it starts
 	p.rep = newReporter(p.reportTo, &p.reports)
 	p.loadPoster(it)
@@ -334,11 +396,12 @@ func (p *Player) begin(it *emby.Item, start time.Duration, st *Stream) {
 		p.resolved(st, nil, p.pickSubFor(st), p.sgen)
 	} else {
 		p.resolve(Request{Item: it, Start: start, MaxBitrate: p.cfg.MaxBitrate,
-			MediaSourceID: p.want.MediaSourceID, AudioIndex: p.want.AudioIndex})
+			MediaSourceID: p.want.MediaSourceID, AudioIndex: p.want.AudioIndex, SubtitleIndex: p.want.SubtitleIndex})
 	}
 	if it.Type == emby.TypeEpisode && p.nextEpisode != nil {
 		p.fetchNext(it)
 	}
+	p.loadSegments(it.ID)
 }
 
 // resolve asks the source for a stream on a goroutine, and applies the
@@ -346,11 +409,13 @@ func (p *Player) begin(it *emby.Item, start time.Duration, st *Stream) {
 // bitmap subtitle to burn in, before AVPlayer opens anything.
 func (p *Player) resolve(req Request) {
 	p.sgen++
-	gen, sgen, ctx, src := p.gen, p.sgen, p.ctx, p.src
+	gen, sgen, ctx, open := p.gen, p.sgen, p.ctx, p.streamOpener()
 	audioPref, subPref := p.cfg.AudioLang, p.cfg.SubtitleLang
 	wantAudio, wantSub := req.AudioIndex, p.want.SubtitleIndex
+	p.reports.Add(1)
 	go func() {
-		st, err := src.Open(ctx, req)
+		defer p.reports.Done()
+		st, err := open(ctx, req)
 		sub := -1
 		if err == nil && st.Playback != nil {
 			pb := st.Playback
@@ -369,19 +434,24 @@ func (p *Player) resolve(req Request) {
 			}
 			if audio != st.AudioIndex || burn != st.BurnedIn {
 				again := req
+				again.MediaSourceID = pb.MediaSourceID
 				if audio != st.AudioIndex {
 					again.AudioIndex = emby.Index(audio)
 				}
 				if burn >= 0 {
 					again.BurnIn = emby.Index(burn)
 				}
-				if st2, err2 := src.Open(ctx, again); err2 == nil {
+				if st2, err2 := open(ctx, again); err2 == nil {
 					p.discard(st)
 					st = st2
 				} else if burn >= 0 {
 					sub = -1 // plays, without the bitmap subtitle
 				}
 			}
+		}
+		if ctx.Err() != nil {
+			p.discard(st)
+			return
 		}
 		p.post(func() {
 			if gen != p.gen || sgen != p.sgen || !p.active {
@@ -399,14 +469,6 @@ func (p *Player) discard(st *Stream) {
 		return
 	}
 	st.close()
-	if st.Method == emby.Transcode && st.Playback != nil && p.reportTo != nil {
-		session, to := st.Playback.PlaySessionID, p.reportTo
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), reportTimeout)
-			defer cancel()
-			_ = to.StopTranscoding(ctx, session)
-		}()
-	}
 }
 
 func defaultSubtitle(pb *emby.Playback) int {
@@ -441,6 +503,9 @@ func (p *Player) resolved(st *Stream, err error, sub int, sgen uint64) {
 		p.fail(err, !errors.Is(err, ErrUnplayable))
 		return
 	}
+	if st.Playback != nil {
+		p.mediaSourceID = st.Playback.MediaSourceID
+	}
 	eng, err := p.open(st.URL)
 	if err != nil {
 		p.discard(st)
@@ -464,6 +529,9 @@ func (p *Player) resolved(st *Stream, err error, sub int, sgen uint64) {
 		if p.runtime == 0 {
 			p.runtime = pb.Runtime()
 		}
+		if !p.segmentsFromServer && len(p.segments) == 0 && len(p.chapters) > 0 && p.runtime > 0 {
+			p.segments = emby.SegmentsFromChapters(p.chapters, p.runtime)
+		}
 	}
 	p.audioIdx = st.AudioIndex
 	// Silent until it stands where it starts (firstPicture sets it).
@@ -478,6 +546,8 @@ func (p *Player) resolved(st *Stream, err error, sub int, sgen uint64) {
 	p.dur, p.durAt, p.posAt = 0, time.Time{}, time.Time{}
 	p.phase = phasePlaying
 	p.showSubtitle(sub)
+	p.syncKeepAwake()
+	p.refreshDiagnostics()
 }
 
 // fail shows the error panel.
@@ -486,16 +556,9 @@ func (p *Player) fail(err error, retry bool) {
 	p.errText = errorText(err)
 	p.errRetry = retry
 	log.Printf("player: %v", err)
-	if p.cur != nil {
-		if p.cur.ready {
-			p.lastPos = p.cur.eng.Position()
-		}
-		p.cur.close()
-		p.cur = nil
-	}
-	p.prev.close()
-	p.prev = nil
-	p.switching = false
+	p.lastPos = p.position()
+	p.finishPlayback(false)
+	p.clearOSMedia(false)
 }
 
 // errorText says what went wrong, in the user's words.
@@ -526,7 +589,9 @@ func (p *Player) retry() {
 		return
 	}
 	pos := p.lastPos
+	p.want = Options{MediaSourceID: p.mediaSourceID}
 	p.begin(p.item, pos, nil)
+	p.want = Options{}
 }
 
 // endSession reports the end of what plays and releases it. finished
@@ -539,44 +604,52 @@ func (p *Player) endSession(finished bool) {
 	if p.item == nil {
 		return
 	}
-	pos := p.position()
-	if p.started {
-		r := p.report(pos)
-		if finished && p.runtime > 0 {
-			r.PositionTicks = emby.DurationToTicks(max(pos, p.runtime))
-		}
-		session := ""
-		if p.cur != nil && p.cur.stream.Method == emby.Transcode && p.cur.stream.Playback != nil {
-			session = p.cur.stream.Playback.PlaySessionID
-		}
-		p.rep.finish(r, session)
-	} else {
-		// Never started: nothing to report, and no resume point to
-		// overwrite. A server transcode asked for still ends.
-		if p.cur != nil {
-			p.discard(p.cur.stream)
-			p.cur.stream = nil
-		}
-		p.rep.end()
-	}
-	p.rep = nil
-	if p.cur != nil {
-		if p.cur.eng != nil {
-			p.cur.eng.Close()
-		}
-		p.cur.stream.close()
-		p.cur = nil
-	}
-	p.prev.close()
-	p.prev = nil
-	p.switching = false
+	p.finishPlayback(finished)
 	p.discard(p.upNext.stream)
 	p.upNext = upNextState{}
 	p.subGen++
 	p.subs.reset()
+	p.clearOSMedia(false)
 	p.item = nil
+	p.chapters = nil
+	p.userSubs = nil
 	p.phase = phaseIdle
 	p.poster = nil
+}
+
+// finishPlayback also runs on engine failure, while item and version stay
+// available for Retry. Both sides of an unfinished switch must be released.
+func (p *Player) finishPlayback(finished bool) {
+	r := p.report(p.position())
+	if finished && p.runtime > 0 {
+		r.PositionTicks = emby.DurationToTicks(max(p.position(), p.runtime))
+	}
+	var releases []func()
+	for _, pl := range []*playing{p.cur, p.prev} {
+		if pl != nil {
+			if release := pl.stream.takeServerRelease(); release != nil {
+				releases = append(releases, release)
+			}
+			pl.close()
+		}
+	}
+	release := func() {
+		for _, f := range releases {
+			f()
+		}
+	}
+	if p.started {
+		p.rep.finishWithRelease(r, release)
+	} else {
+		release()
+		p.rep.end()
+	}
+	p.rep = nil
+	p.started = false
+	p.cur, p.prev = nil, nil
+	p.switching = false
+	p.pendingSwitch = nil
+	p.resetSegmentsAndTrickplay()
 }
 
 // Close reports the end of playback and releases everything, without
@@ -588,6 +661,7 @@ func (p *Player) Close() {
 		p.enteredFullscreen = false
 	}
 	p.endSession(p.finished)
+	p.clearOSMedia(true)
 	p.active = false
 }
 
@@ -600,7 +674,7 @@ func (p *Player) Flush(timeout time.Duration) bool {
 // Result returns how things stand: the item, where it stands and the
 // sound settings.
 func (p *Player) Result() Result {
-	r := Result{Volume: p.volume, Muted: p.muted, Finished: p.finished, Position: p.position()}
+	r := Result{Volume: p.volume, Muted: p.muted, Finished: p.finished, Position: p.position(), SubtitleScale: p.subScale}
 	if p.item != nil {
 		r.ItemID = p.item.ID
 	}
@@ -624,6 +698,9 @@ func (p *Player) position() time.Duration {
 	if p.cur != nil && p.cur.ready {
 		return p.cur.eng.Position()
 	}
+	if p.prev != nil && p.prev.ready {
+		return p.prev.eng.Position()
+	}
 	return p.lastPos
 }
 
@@ -631,7 +708,7 @@ func (p *Player) position() time.Duration {
 func (p *Player) report(pos time.Duration) emby.PlaybackReport {
 	var r emby.PlaybackReport
 	pl := p.cur
-	if pl == nil {
+	if pl == nil || !pl.ready && p.prev != nil {
 		pl = p.prev
 	}
 	if pl != nil && pl.stream != nil && pl.stream.Playback != nil {
@@ -650,7 +727,7 @@ func (p *Player) report(pos time.Duration) emby.PlaybackReport {
 	case p.subIdx == -1:
 		r.SubtitleStreamIndex = emby.Index(-1)
 	default:
-		if _, local := p.localSubtitle(p.subIdx); !local {
+		if _, local := p.localSubtitle(p.subIdx); !local && p.subIdx >= 0 {
 			r.SubtitleStreamIndex = emby.Index(p.subIdx)
 		}
 	}
@@ -688,6 +765,8 @@ func (p *Player) togglePlay(now time.Time) {
 		pl.eng.Seek(0)
 		pl.eng.Play()
 		p.userPaused = false
+		p.syncKeepAwake()
+		p.syncNowPlayingPlayback()
 		return
 	}
 	if p.userPaused {
@@ -699,6 +778,8 @@ func (p *Player) togglePlay(now time.Time) {
 		p.userPaused = true
 		p.sendProgress(now, "Pause")
 	}
+	p.syncKeepAwake()
+	p.syncNowPlayingPlayback()
 }
 
 func (p *Player) skip(now time.Time, d time.Duration) {
@@ -736,6 +817,7 @@ func (p *Player) setRate(now time.Time, r float64) {
 		p.cur.eng.SetRate(r)
 	}
 	p.sendProgress(now, "PlaybackRateChange")
+	p.syncNowPlaying(now)
 }
 
 func (p *Player) toggleFullscreen() {
@@ -782,6 +864,15 @@ func (p *Player) selectSubtitle(index int) {
 		p.sendProgress(p.now, "SubtitleTrackChange")
 		return
 	}
+	if _, ok := p.userSubs[index]; ok {
+		if p.cur.stream.BurnedIn >= 0 {
+			p.switchStream(Request{AudioIndex: emby.Index(p.audioIdx)}, func() { p.showSubtitle(index) })
+		} else {
+			p.showSubtitle(index)
+		}
+		p.sendProgress(p.now, "SubtitleTrackChange")
+		return
+	}
 	t := trackByIndex(p.subTracks, index)
 	burned := p.cur.stream.BurnedIn
 	switch {
@@ -812,14 +903,21 @@ func (p *Player) switchStream(req Request, done func()) {
 		pos = old.start
 	}
 	req.Item, req.Start, req.MaxBitrate = p.item, pos, p.cfg.MaxBitrate
+	req.MediaSourceID = p.mediaSourceID
 	wasPlaying := !p.userPaused
 	old.eng.Pause()
 	p.switching = true
 	p.seek.reset()
 	p.sgen++
-	gen, sgen, ctx, src := p.gen, p.sgen, p.ctx, p.src
+	gen, sgen, ctx, open := p.gen, p.sgen, p.ctx, p.streamOpener()
+	p.reports.Add(1)
 	go func() {
-		st, err := src.Open(ctx, req)
+		defer p.reports.Done()
+		st, err := open(ctx, req)
+		if ctx.Err() != nil {
+			p.discard(st)
+			return
+		}
 		p.post(func() {
 			if gen != p.gen || sgen != p.sgen || !p.active || p.cur != old {
 				p.discard(st)
@@ -862,29 +960,40 @@ func (p *Player) showSubtitle(index int) {
 	p.subGen++
 	p.subs.reset()
 	p.subIdx = index
+	if us, ok := p.userSubs[index]; ok {
+		p.subs.load(us)
+		p.refreshDiagnostics()
+		return
+	}
 	t := trackByIndex(p.subTracks, index)
 	if t == nil || !t.IsText || p.cur == nil {
 		if t != nil && !t.IsText && p.cur != nil && p.cur.stream.BurnedIn == index {
+			p.refreshDiagnostics()
 			return // burned in: nothing to draw
 		}
 		if t == nil {
 			p.subIdx = -1
 		}
+		p.refreshDiagnostics()
 		return
 	}
 	if local, ok := p.localSubtitle(index); ok && local.Reason != "" {
 		p.subIdx = -1
+		p.refreshDiagnostics()
 		return
 	}
 	if emb := p.cur.stream.Embedded; emb != nil {
 		if feed := emb(index); feed != nil {
 			p.subs.follow(feed)
+			p.refreshDiagnostics()
 			return
 		}
 	}
 	if t.URL == "" || p.fetchSubs == nil {
+		p.refreshDiagnostics()
 		return
 	}
+	p.refreshDiagnostics()
 	gen, sgen, url, ctx, fetch := p.gen, p.subGen, t.URL, p.ctx, p.fetchSubs
 	go func() {
 		sub, err := fetch(ctx, url)
@@ -906,6 +1015,154 @@ func (p *Player) localSubtitle(index int) (localSubtitle, bool) {
 	return local, ok
 }
 
+// SetSubtitleScale updates the subtitle font scale immediately while playing.
+func (p *Player) SetSubtitleScale(scale float64) {
+	p.setSubScale(scale)
+}
+
+func clampSubScale(s float64) float64 {
+	if s <= 0 {
+		return 1
+	}
+	return min(max(s, 0.6), 2.0)
+}
+
+func (p *Player) effectiveSubScale() float64 {
+	if p.subScale <= 0 {
+		return 1
+	}
+	return p.subScale
+}
+
+func (p *Player) setSubScale(s float64) {
+	p.subScale = clampSubScale(s)
+}
+
+func (p *Player) adjustSubOffset(delta time.Duration) {
+	p.setSubOffset(p.subOffset + delta)
+}
+
+func (p *Player) setSubOffset(off time.Duration) {
+	p.subOffset = off
+	p.refreshDiagnostics()
+}
+
+func (p *Player) canPickSubtitle() bool {
+	return p.cfg.PickSubtitleFile != nil || p.cfg.Window != nil
+}
+
+func (p *Player) loadLocalSubtitleFile() {
+	if !p.active || p.cur == nil || !p.canPickSubtitle() {
+		return
+	}
+	gen := p.gen
+	pick := p.cfg.PickSubtitleFile
+	if pick == nil {
+		win := p.cfg.Window
+		pick = func() (string, error) {
+			paths, err := mygo.Dialog.Open(mygo.OpenDialogOptions{
+				Parent: win,
+				Title:  str.LoadLocalSubtitle,
+				Filters: []mygo.FileFilter{{
+					Name:       str.Subtitles,
+					Extensions: []string{"srt", "vtt", "ass", "ssa", "sub"},
+				}},
+			})
+			if err != nil || len(paths) == 0 {
+				return "", err
+			}
+			return paths[0], nil
+		}
+	}
+	go func() {
+		path, err := pick()
+		if err != nil || path == "" {
+			if err != nil {
+				log.Printf("player: pick subtitle: %v", err)
+			}
+			return
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			log.Printf("player: open subtitle %s: %v", filepath.Base(path), err)
+			return
+		}
+		defer f.Close()
+		const maxLocalSubBytes = 16 << 20
+		data, err := io.ReadAll(io.LimitReader(f, maxLocalSubBytes+1))
+		if err != nil {
+			log.Printf("player: read subtitle %s: %v", filepath.Base(path), err)
+			return
+		}
+		if len(data) > maxLocalSubBytes {
+			log.Printf("player: local subtitle %s exceeds %d bytes", filepath.Base(path), maxLocalSubBytes)
+			return
+		}
+		parsed, err := emby.ParseSubtitles(data)
+		if err != nil && !errors.Is(err, emby.ErrNoCues) {
+			log.Printf("player: parse subtitle %s: %v", filepath.Base(path), err)
+			return
+		}
+		name := filepath.Base(path)
+		p.post(func() {
+			if gen != p.gen || !p.active {
+				return
+			}
+			p.addUserSubtitle(name, parsed)
+		})
+	}()
+}
+
+func (p *Player) addUserSubtitle(name string, parsed *emby.Subtitles) {
+	if parsed == nil || p.cur == nil {
+		return
+	}
+	if p.userSubs == nil {
+		p.userSubs = map[int]*emby.Subtitles{}
+	}
+	id := -1000 - len(p.userSubs)
+	p.userSubs[id] = parsed
+	title := name + " (" + str.LocalSubtitleTag + ")"
+	tr := emby.Track{
+		Index:        id,
+		Type:         emby.StreamSubtitle,
+		IsText:       true,
+		IsExternal:   true,
+		DisplayTitle: title,
+	}
+	p.subTracks = append(p.subTracks, tr)
+	p.subLabels = append(p.subLabels, tr.Label())
+	p.selectSubtitle(id)
+}
+
+func (p *Player) chapterAt(pos time.Duration) int {
+	cur := -1
+	for i := range p.chapters {
+		if p.chapters[i].Start() <= pos {
+			cur = i
+		} else {
+			break
+		}
+	}
+	return cur
+}
+
+func (p *Player) seekTo(now time.Time, target time.Duration) {
+	pl := p.cur
+	if pl == nil || !pl.ready {
+		return
+	}
+	dur := p.duration(now, pl.eng)
+	p.seek.seekTo(now, clampSeek(target, dur))
+}
+
+func (p *Player) effectiveDur() time.Duration {
+	if p.dur > 0 {
+		return p.dur
+	}
+	return p.runtime
+}
+
 // fetchNext finds the episode after it, for the next button and the
 // countdown at the end.
 func (p *Player) fetchNext(it *emby.Item) {
@@ -922,6 +1179,7 @@ func (p *Player) fetchNext(it *emby.Item) {
 			if gen == p.gen {
 				p.nextItem = next
 				p.nextTitle, _ = titles(next)
+				p.syncNowPlaying(p.now)
 			}
 		})
 	}()
@@ -934,10 +1192,16 @@ func (p *Player) prefetchNext() {
 		return
 	}
 	p.upNext.fetching = true
-	gen, ctx, src := p.gen, p.ctx, p.src
+	gen, ctx, open := p.gen, p.ctx, p.streamOpener()
 	req := Request{Item: p.nextItem, Start: p.nextItem.ResumePosition(), MaxBitrate: p.cfg.MaxBitrate}
+	p.reports.Add(1)
 	go func() {
-		st, err := src.Open(ctx, req)
+		defer p.reports.Done()
+		st, err := open(ctx, req)
+		if ctx.Err() != nil {
+			p.discard(st)
+			return
+		}
 		p.post(func() {
 			if gen != p.gen || !p.upNext.shown || p.upNext.cancelled {
 				p.discard(st)

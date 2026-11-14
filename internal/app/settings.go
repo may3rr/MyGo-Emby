@@ -28,6 +28,10 @@ type Settings struct {
 	// SidebarCollapsed hides the sidebar, giving its width to the page.
 	// The false zero value keeps older settings expanded.
 	SidebarCollapsed bool `json:"sidebarCollapsed,omitempty"`
+	// SubtitleScale scales rendered subtitles in the built-in player (0 = 1.0x).
+	SubtitleScale float64 `json:"subtitleScale,omitempty"`
+	// SearchHistory holds recent searches shown on the empty search page.
+	SearchHistory []string `json:"searchHistory,omitempty"`
 	// DeviceID tells this installation apart to the servers, which keep
 	// its sessions by it: made once, on the first run, and kept.
 	DeviceID string `json:"deviceId,omitempty"`
@@ -134,10 +138,18 @@ func (st *settingsStore) writePending() error {
 		return nil
 	}
 	data, err := json.MarshalIndent(s, "", "  ")
+	if err == nil {
+		err = writeFileAtomic(st.path, data)
+	}
 	if err != nil {
+		st.mu.Lock()
+		if st.pending == nil {
+			st.pending = s
+		}
+		st.mu.Unlock()
 		return err
 	}
-	return writeFileAtomic(st.path, data)
+	return nil
 }
 
 // saveSettings writes the app's settings in the background.

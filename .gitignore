@@ -10,3 +10,14 @@ mygo_windows_*.syso
 *.pem
 *.key
 __pycache__/
+/archive/
+/HANDOFF.md
+/AGENTS.md
+/CLAUDE.md
+/.claude/
+/handoffs/
+/notes.md
+/task_plan.md
+/docs/PROJECT_PLAN.md
+/docs/media-format-support-research.md
+/docs/multi-source-selection-bug.md

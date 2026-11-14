@@ -146,11 +146,12 @@ func (a *app) itemCard(c *ui.Context, it *emby.Item, o cardOpts) {
 	a.posterCard(c, s)
 }
 
-// openItem opens it: a series or what plays on its page; a folder, a box
-// set or an album in the library page, a level down.
+// openItem opens it: a series, box set, playlist, or what plays on its
+// detail page; a folder or an album in the library page, a level down.
 func (a *app) openItem(it *emby.Item, libID string) {
 	switch {
-	case it.Type == emby.TypeSeries || it.IsPlayable() || !it.IsFolderLike():
+	case it.Type == emby.TypeSeries || it.Type == emby.TypeBoxSet || it.Type == emby.TypePlaylist ||
+		it.IsPlayable() || !it.IsFolderLike():
 		a.navigate(pathItem(it.ID))
 	default:
 		if libID == "" {

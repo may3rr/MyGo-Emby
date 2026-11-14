@@ -112,6 +112,10 @@ type Decision struct {
 	// Reason explains Remux and Unsupported, in English, for logs; the UI
 	// shows its own words.
 	Reason string
+	// Err identifies an Unsupported reason as a container or video-codec
+	// failure. Callers can preserve it with errors.Is instead of replacing
+	// the actionable cause with a generic playback error.
+	Err error
 	// AudioIndex is the audio track that will play (an Emby MediaStream
 	// index), -1 for none.
 	AudioIndex int

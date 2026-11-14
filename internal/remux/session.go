@@ -160,19 +160,24 @@ func newSession(ctx context.Context, srv *Server, src Source, bs byteSource) (*S
 	}
 	x.video = info.video
 	idx := embyIndexes(src.MediaSource, info)
+	var selectedAudio *track
+	if !src.NoAudio && src.AudioIndex >= 0 {
+		for _, t := range info.audio {
+			if i, ok := idx[t]; ok && i == src.AudioIndex || !ok && src.MediaSource == nil && t.order == src.AudioIndex {
+				selectedAudio = t
+				break
+			}
+		}
+		if selectedAudio == nil {
+			return nil, fmt.Errorf("%w: selected audio track %d is not in the container", ErrUnsupportedAudio, src.AudioIndex)
+		}
+	}
 
 	// The audio track. Prefer one that can be copied when the caller left
 	// the choice open. An explicitly selected or only track may use the
 	// audio-only transcoder; it must never become a silent video stream.
 	if !src.NoAudio && len(info.audio) > 0 {
-		var a *track
-		if src.AudioIndex >= 0 {
-			for _, t := range info.audio {
-				if i, ok := idx[t]; ok && i == src.AudioIndex || !ok && src.MediaSource == nil && t.order == src.AudioIndex {
-					a = t
-				}
-			}
-		}
+		a := selectedAudio
 		if a == nil {
 			for _, t := range info.audio {
 				if t.isDefault && t.out != nil {
@@ -785,4 +790,10 @@ func (x *Session) startReadAhead() {
 func (x *Session) segmentAt(t time.Duration) int {
 	i := sort.Search(len(x.segs), func(i int) bool { return x.segs[i].start > t })
 	return max(i-1, 0)
+}
+
+// AudioTranscoded reports whether this remux session uses the optional FFmpeg
+// audio transcoder instead of copying the container audio track.
+func (x *Session) AudioTranscoded() bool {
+	return x != nil && x.transcodeAudio
 }

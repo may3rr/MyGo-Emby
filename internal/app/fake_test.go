@@ -279,6 +279,7 @@ func (f *fakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			case q.Get("SearchTerm") != "" && !strings.Contains(strings.ToLower(it.Name), strings.ToLower(q.Get("SearchTerm"))):
 			case strings.Contains(q.Get("Filters"), "IsFavorite") && !it.IsFavorite():
 			case q.Get("PersonIds") != "" && !slices.ContainsFunc(it.People, func(p emby.Person) bool { return p.ID == q.Get("PersonIds") }):
+			case q.Get("Genres") != "" && !slices.ContainsFunc(it.Genres, func(g string) bool { return strings.EqualFold(g, q.Get("Genres")) }):
 			default:
 				out = append(out, it)
 			}

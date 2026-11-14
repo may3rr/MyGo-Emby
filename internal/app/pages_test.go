@@ -128,6 +128,63 @@ func TestItemTracksReachPlay(t *testing.T) {
 	}
 }
 
+func TestItemFiltersSourcesThatNeedUnavailableTranscode(t *testing.T) {
+	a, tt, f := signedInApp(t, 1280, 900)
+	f.set(func(f *fakeServer) {
+		m := &f.children[f.views[0].ID][0]
+		m.MediaSources = []emby.MediaSource{
+			{
+				ID: "disc", Name: "70.0G", Container: "blurayiso",
+				MediaStreams: []emby.MediaStream{
+					{Index: 0, Type: emby.StreamVideo, Codec: "hevc", IsDefault: true},
+					{Index: 1, Type: emby.StreamAudio, Codec: "truehd", IsDefault: true},
+				},
+			},
+			{
+				ID: "mkv", Name: "69.2G", Container: "mkv",
+				MediaStreams: []emby.MediaStream{
+					{Index: 0, Type: emby.StreamVideo, Codec: "hevc", IsDefault: true},
+					{Index: 1, Type: emby.StreamAudio, Codec: "eac3", IsDefault: true},
+				},
+			},
+			{
+				ID: "mp4", Name: "7.8G", Container: "mp4",
+				MediaStreams: []emby.MediaStream{
+					{Index: 0, Type: emby.StreamVideo, Codec: "h264", CodecTag: "avc1", IsDefault: true},
+					{Index: 1, Type: emby.StreamAudio, Codec: "aac", IsDefault: true},
+				},
+			},
+		}
+	})
+	a.navigate(pathItem("Home-m-0"))
+	settle(tt)
+	a.waitFor(t, tt, "the playable version menu", func() bool {
+		return tt.HasText(str.Version + "：69.2G")
+	})
+	if tt.HasText("70.0G") {
+		t.Fatal("an unsupported disc image appears in the version menu")
+	}
+	if err := tt.Click(str.Version + "：69.2G"); err != nil {
+		t.Fatal(err)
+	}
+	if tt.HasText("70.0G") {
+		t.Fatal("an unsupported disc image appears in the opened version menu")
+	}
+	if !tt.HasText("7.8G") {
+		t.Fatal("a supported alternate version is missing")
+	}
+	if err := tt.Click("7.8G"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if err := tt.Click(str.Play); err != nil {
+		t.Fatal(err)
+	}
+	if a.lastPlay == nil || a.lastPlay.opts.MediaSourceID != "mp4" {
+		t.Fatalf("Play used %+v, want the selected MP4 version", a.lastPlay)
+	}
+}
+
 func TestFavoriteAndPlayedButtons(t *testing.T) {
 	a, tt, f := signedInApp(t, 1280, 900)
 	a.navigate(pathItem("Home-m-0"))

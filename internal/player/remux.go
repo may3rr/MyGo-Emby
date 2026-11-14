@@ -3,6 +3,8 @@ package player
 import (
 	"context"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 
 	"mygo-emby/internal/emby"
@@ -22,9 +24,9 @@ func RemuxFallback(srv *remux.Server) func(ctx context.Context, p *emby.Playback
 		d := remux.Decide(&p.Source, want)
 		switch {
 		case d.Mode == remux.Unsupported:
-			return nil, &UnplayableError{Reason: str.ErrNotPlayable}
+			return nil, unsupportedRemuxError(d, &p.Source)
 		case d.Mode == remux.DirectPlay:
-			return &Stream{URL: p.StreamURL, Method: p.Method, Playback: p, AudioIndex: d.AudioIndex, BurnedIn: -1}, nil
+			return &Stream{URL: p.StreamURL, Method: p.Method, Pipeline: str.PipeDirect, Playback: p, AudioIndex: d.AudioIndex, BurnedIn: -1}, nil
 		}
 
 		feeds := &cueFeeds{m: map[int]*CueFeed{}}
@@ -49,7 +51,7 @@ func RemuxFallback(srv *remux.Server) func(ctx context.Context, p *emby.Playback
 			}
 			if errors.Is(err, remux.ErrUnsupportedFormat) || errors.Is(err, remux.ErrUnsupportedVideo) ||
 				errors.Is(err, remux.ErrUnsupportedAudio) {
-				return nil, &UnplayableError{Reason: str.ErrNotPlayable}
+				return nil, unsupportedRemuxSessionError(err, &p.Source)
 			}
 			return nil, err
 		}
@@ -68,9 +70,14 @@ func RemuxFallback(srv *remux.Server) func(ctx context.Context, p *emby.Playback
 				embedded[t.ID] = t.FeedIndex
 			}
 		}
+		pipe := str.PipeLocalRemux
+		if sess.AudioTranscoded() {
+			pipe = str.PipeLocalRemuxAudio
+		}
 		return &Stream{
 			URL:            sess.PlaylistURL,
 			Method:         emby.DirectPlay, // the server sends the file as it is
+			Pipeline:       pipe,
 			Playback:       p,
 			AudioIndex:     sess.AudioIndex,
 			BurnedIn:       -1,
@@ -89,6 +96,39 @@ func RemuxFallback(srv *remux.Server) func(ctx context.Context, p *emby.Playback
 			},
 		}, nil
 	}
+}
+
+func unsupportedRemuxError(d remux.Decision, source *emby.MediaSource) *UnplayableError {
+	cause := d.Err
+	if cause != nil && d.Reason != "" {
+		cause = fmt.Errorf("%w: %s", cause, d.Reason)
+	}
+	reason := str.ErrNotPlayable
+	if errors.Is(d.Err, remux.ErrUnsupportedFormat) && isDiscImage(source) {
+		reason = str.ErrDiscImage
+	}
+	return &UnplayableError{Reason: reason, Err: cause}
+}
+
+func unsupportedRemuxSessionError(err error, source *emby.MediaSource) *UnplayableError {
+	reason := str.ErrNotPlayable
+	if errors.Is(err, remux.ErrUnsupportedFormat) && isDiscImage(source) {
+		reason = str.ErrDiscImage
+	}
+	return &UnplayableError{Reason: reason, Err: err}
+}
+
+func isDiscImage(source *emby.MediaSource) bool {
+	if source == nil {
+		return false
+	}
+	for _, container := range strings.Split(strings.ToLower(source.Container), ",") {
+		switch strings.TrimSpace(container) {
+		case "iso", "blurayiso", "dvdiso", "bluray", "dvd":
+			return true
+		}
+	}
+	return false
 }
 
 // localSubtitles converts the session's real container tracks to stable

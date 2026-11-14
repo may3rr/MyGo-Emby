@@ -465,6 +465,7 @@ func (a *app) resetData() {
 	a.lists = map[string]*listState{}
 	a.details = map[string]*detailState{}
 	a.people = map[string]*personState{}
+	a.genres = map[string]*genreState{}
 	a.favs = &favState{}
 	a.found = &searchState{sel: -1}
 	a.form = settingsForm{}

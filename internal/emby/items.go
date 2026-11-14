@@ -71,7 +71,7 @@ var DetailFields = []string{
 	FieldChapters, FieldStudios, FieldProviderIDs, FieldTaglines, FieldExternalURLs,
 	FieldPrimaryImageAspectRatio, FieldDateCreated, FieldChildCount,
 	FieldRecursiveItemCount, FieldOriginalTitle, FieldTags, FieldPremiereDate,
-	FieldProductionYear, "RemoteTrailers", "Width", "Height",
+	FieldProductionYear, "RemoteTrailers", "Width", "Height", "Trickplay",
 }
 
 // listImageTypes limits list responses to the image types cards use.

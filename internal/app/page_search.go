@@ -137,11 +137,47 @@ func (a *app) searchKey(key ui.Key) bool {
 
 // openHit opens a result.
 func (a *app) openHit(h searchHit) {
+	if s := a.found; s != nil {
+		if q := strings.TrimSpace(s.query); q != "" {
+			a.recordSearch(q)
+		} else if q := strings.TrimSpace(s.typed); q != "" {
+			a.recordSearch(q)
+		}
+	}
 	if h.item.Type == emby.TypePerson {
 		a.navigate(pathPerson(h.item.ID))
 		return
 	}
 	a.openItem(h.item, "")
+}
+
+const maxSearchHistory = 12
+
+func (a *app) recordSearch(q string) {
+	q = strings.TrimSpace(q)
+	if q == "" {
+		return
+	}
+	next := make([]string, 0, min(len(a.settings.SearchHistory)+1, maxSearchHistory))
+	next = append(next, q)
+	for _, old := range a.settings.SearchHistory {
+		if !strings.EqualFold(old, q) {
+			next = append(next, old)
+			if len(next) >= maxSearchHistory {
+				break
+			}
+		}
+	}
+	a.settings.SearchHistory = next
+	a.saveSettings()
+}
+
+func (a *app) clearSearchHistory() {
+	if len(a.settings.SearchHistory) == 0 {
+		return
+	}
+	a.settings.SearchHistory = nil
+	a.saveSettings()
 }
 
 func (a *app) searchPage(c *ui.Context, r *ui.Route) {
@@ -157,7 +193,11 @@ func (a *app) searchPage(c *ui.Context, r *ui.Route) {
 		hits := s.hits()
 		switch {
 		case q == "":
-			a.emptyState(c, emptySpec{Icon: iconSearch, Title: str.SearchHint})
+			if len(a.settings.SearchHistory) > 0 {
+				a.searchHistoryView(c)
+			} else {
+				a.emptyState(c, emptySpec{Icon: iconSearch, Title: str.SearchHint})
+			}
 		case s.err != nil && s.query == q:
 			a.errorState(c, a.errText(s.err), func() { a.runSearch(q) })
 		case s.res == nil || (s.loading && len(hits) == 0):
@@ -167,6 +207,34 @@ func (a *app) searchPage(c *ui.Context, r *ui.Route) {
 		default:
 			a.searchResults(c, hits)
 		}
+	})
+}
+
+func (a *app) searchHistoryView(c *ui.Context) {
+	p := a.pal
+	ui.Column(c.Key("history")).Gap(12).MaxWidth(820).Children(func() {
+		ui.Row(c.Key("hdr")).AlignItems(ui.Center).Children(func() {
+			ui.Text(c, str.SearchRecent).FontSize(fsHeadline).FontWeight(wSemibold).TextColor(p.text)
+			ui.Spacer(c)
+			b := ui.ButtonBase(c.Key("clear-history")).Height(26).PaddingX(10).Radius(13).
+				AlignItems(ui.Center).Label(str.ClearHistory)
+			if b.Hovered() {
+				b.Background(p.hover)
+			}
+			b.Children(func() {
+				ui.Text(c, str.ClearHistory).FontSize(fsCaption).TextColor(p.text2)
+			})
+			b.OnClick(a.clearSearchHistory)
+		})
+		ui.Row(c.Key("chips")).Gap(8).Wrap().Children(func() {
+			for _, item := range a.settings.SearchHistory {
+				term := item
+				a.chip(c, term, true).OnClick(func() {
+					a.search = term
+					a.router.Replace(pathSearch(term))
+				})
+			}
+		})
 	})
 }
 

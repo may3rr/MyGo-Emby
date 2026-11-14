@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -286,6 +287,67 @@ func TestItemsQueryParameters(t *testing.T) {
 	}
 }
 
+func TestCredentialOrigin(t *testing.T) {
+	const token = "private-session-token"
+	authHeaders := []string{"Authorization", "X-Emby-Authorization", "X-Emby-Token"}
+	external := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, name := range authHeaders {
+			if r.Header.Get(name) != "" {
+				t.Errorf("external request leaked %s", name)
+			}
+		}
+		io.WriteString(w, "WEBVTT\n\n00:01.000 --> 00:02.000\nhi\n")
+	}))
+	defer external.Close()
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("X-Emby-Token") != token {
+			t.Error("same-origin request lost authentication")
+		}
+		switch r.URL.Path {
+		case "/same":
+			http.Redirect(w, r, "/subtitle", http.StatusFound)
+		case "/external":
+			http.Redirect(w, r, external.URL+"/subtitle", http.StatusFound)
+		default:
+			io.WriteString(w, "WEBVTT\n\n00:01.000 --> 00:02.000\nhi\n")
+		}
+	}))
+	defer origin.Close()
+	c, err := RestoreClient(Session{ServerURL: origin.URL, UserID: "u", Token: token}, testDevice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rawURL := range []string{external.URL, origin.URL + "/same", origin.URL + "/external"} {
+		if _, err := c.FetchSubtitles(context.Background(), rawURL); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// API requests use the same redirect policy as subtitle downloads.
+	if err := c.do(context.Background(), http.MethodGet, "/external", nil, nil, nil); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportErrorRedactsURL(t *testing.T) {
+	dead := httptest.NewServer(http.NotFoundHandler())
+	dead.Close()
+	c, err := NewClient(dead.URL, testDevice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = c.FetchSubtitles(context.Background(), dead.URL+"/subtitle?api_key=private-token&ApiKey=private-token")
+	if !errors.Is(err, ErrUnreachable) {
+		t.Fatalf("expected transport error, got %v", err)
+	}
+	if strings.Contains(err.Error(), "private-token") {
+		t.Error("transport error text exposes the token")
+	}
+	var transportErr *url.Error
+	if !errors.As(err, &transportErr) {
+		t.Error("underlying transport error must remain available")
+	}
+}
+
 func TestDateParsing(t *testing.T) {
 	var v struct {
 		A, B, C, D, E, F Date
@@ -304,5 +366,33 @@ func TestDateParsing(t *testing.T) {
 	b, _ := json.Marshal(v.A)
 	if string(b) != `"2018-09-01T00:00:00Z"` {
 		t.Errorf("marshal = %s", b)
+	}
+}
+
+func TestRedactURLAndDirectStreamURL(t *testing.T) {
+	raw := "https://user:secret@emby.example.com:8096/Videos/v1/stream.mkv?Static=true&MediaSourceId=ms1&api_key=tok123&Token=tok456"
+	got := RedactURL(raw)
+	for _, secret := range []string{"secret", "tok123", "tok456"} {
+		if strings.Contains(got, secret) {
+			t.Errorf("RedactURL leaked %q in %q", secret, got)
+		}
+	}
+	if !strings.Contains(got, "Static=true") || !strings.Contains(got, "MediaSourceId=ms1") || !strings.Contains(got, "REDACTED") {
+		t.Errorf("RedactURL = %q", got)
+	}
+	if bad := RedactURL("://bad/%zz?api_key=leak"); strings.Contains(bad, "leak") {
+		t.Errorf("malformed RedactURL leaked token: %q", bad)
+	}
+
+	c, err := RestoreClient(Session{ServerURL: "https://emby.example.com", UserID: "u1", Token: "secret-tk"}, testDevice)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if u := c.DirectStreamURL("item1", nil); !strings.Contains(u, "/Videos/item1/stream") || !strings.Contains(u, "MediaSourceId=item1") || !strings.Contains(u, "Static=true") {
+		t.Errorf("DirectStreamURL(nil) = %q", u)
+	}
+	src := &MediaSource{ID: "ms9", Container: "mkv,webm"}
+	if u := c.DirectStreamURL("item1", src); !strings.Contains(u, "/Videos/item1/stream.mkv") || !strings.Contains(u, "MediaSourceId=ms9") || !strings.Contains(u, "api_key=secret-tk") {
+		t.Errorf("DirectStreamURL(src) = %q", u)
 	}
 }

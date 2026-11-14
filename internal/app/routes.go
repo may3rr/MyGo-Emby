@@ -49,6 +49,9 @@ func pathItem(id string) string { return "/item/" + url.PathEscape(id) }
 // pathPerson is the page of an actor or a director.
 func pathPerson(id string) string { return "/person/" + url.PathEscape(id) }
 
+// pathGenre is the page listing items tagged with a genre name.
+func pathGenre(name string) string { return "/genre/" + url.PathEscape(name) }
+
 // pages builds the page of r: the one switch where every page is listed.
 func (a *app) pages(c *ui.Context, r *ui.Route) {
 	switch {
@@ -66,6 +69,8 @@ func (a *app) pages(c *ui.Context, r *ui.Route) {
 		a.itemPage(c, r, r.Param("id"))
 	case r.Match("/person/{id}"):
 		a.personPage(c, r, r.Param("id"))
+	case r.Match("/genre/{name}"):
+		a.genrePage(c, r, r.Param("name"))
 	case r.Match(pathSettings):
 		a.settingsPage(c, r)
 	case r.Match(pathGallery) && a.dev:
@@ -137,6 +142,10 @@ func (a *app) prefetch(path string) {
 		a.detail(strings.TrimPrefix(p, "/item/"))
 	case strings.HasPrefix(p, "/person/"):
 		a.person(strings.TrimPrefix(p, "/person/"))
+	case strings.HasPrefix(p, "/genre/"):
+		if name := strings.TrimPrefix(p, "/genre/"); name != "" {
+			a.genre(name)
+		}
 	case p == pathFavorites:
 		a.ensureFavorites()
 	}
@@ -145,7 +154,7 @@ func (a *app) prefetch(path string) {
 // isDetail reports whether path is a page opened from another, not one of
 // the sidebar's.
 func isDetail(path string) bool {
-	return strings.HasPrefix(path, "/item/") || strings.HasPrefix(path, "/person/")
+	return strings.HasPrefix(path, "/item/") || strings.HasPrefix(path, "/person/") || strings.HasPrefix(path, "/genre/")
 }
 
 // Sidebar sections: what a.section returns.

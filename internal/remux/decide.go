@@ -34,7 +34,7 @@ var (
 // Remux: the session finds out what the file is when it opens.
 func Decide(ms *emby.MediaSource, audioIndex int) Decision {
 	if ms == nil {
-		return Decision{Mode: Unsupported, Reason: "no media source", AudioIndex: -1}
+		return Decision{Mode: Unsupported, Reason: "no media source", Err: ErrUnsupportedFormat, AudioIndex: -1}
 	}
 	containers := strings.Split(strings.ToLower(ms.Container), ",")
 	for i := range containers {
@@ -46,7 +46,7 @@ func Decide(ms *emby.MediaSource, audioIndex int) Decision {
 		dead = dead || deadContainers[c]
 	}
 	if dead && !native {
-		return Decision{Mode: Unsupported, Reason: "container " + ms.Container + " cannot be remuxed", AudioIndex: -1}
+		return Decision{Mode: Unsupported, Reason: "container " + ms.Container + " cannot be remuxed", Err: ErrUnsupportedFormat, AudioIndex: -1}
 	}
 
 	video := mainVideo(ms)
@@ -54,18 +54,18 @@ func Decide(ms *emby.MediaSource, audioIndex int) Decision {
 		if len(ms.MediaStreams) == 0 {
 			return Decision{Mode: Remux, Reason: "no stream information; the file is probed", AudioIndex: audioIndex}
 		}
-		return Decision{Mode: Unsupported, Reason: "no video stream", AudioIndex: -1}
+		return Decision{Mode: Unsupported, Reason: "no video stream", Err: ErrUnsupportedVideo, AudioIndex: -1}
 	}
 	vcodec := strings.ToLower(video.Codec)
 	switch vcodec {
 	case "h264", "avc":
 		if video.BitDepth > 8 || strings.Contains(strings.ToLower(video.Profile), "10") ||
 			strings.Contains(video.Profile, "4:2:2") || strings.Contains(video.Profile, "4:4:4") {
-			return Decision{Mode: Unsupported, Reason: "H.264 " + video.Profile + " is not decoded by AVPlayer", AudioIndex: -1}
+			return Decision{Mode: Unsupported, Reason: "H.264 " + video.Profile + " is not decoded by AVPlayer", Err: ErrUnsupportedVideo, AudioIndex: -1}
 		}
 	case "hevc", "h265":
 	default:
-		return Decision{Mode: Unsupported, Reason: "video codec " + video.Codec + " needs transcoding", AudioIndex: -1}
+		return Decision{Mode: Unsupported, Reason: "video codec " + video.Codec + " needs transcoding", Err: ErrUnsupportedVideo, AudioIndex: -1}
 	}
 
 	// The audio track.
@@ -79,8 +79,8 @@ func Decide(ms *emby.MediaSource, audioIndex int) Decision {
 	var audio *emby.MediaStream
 	if audioIndex >= 0 {
 		audio = ms.Stream(audioIndex)
-		if audio != nil && audio.Type != emby.StreamAudio {
-			audio = nil
+		if audio == nil || audio.Type != emby.StreamAudio || audio.IsExternal {
+			return Decision{Mode: Unsupported, Reason: "selected audio is not an embedded track", Err: ErrUnsupportedAudio, AudioIndex: audioIndex}
 		}
 	} else {
 		audio = avplayerAudio

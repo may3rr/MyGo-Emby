@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"slices"
 
 	"github.com/egoist/mygo/ui"
@@ -22,6 +23,24 @@ func (a *app) itemMenu(it *emby.Item) func(m *ui.Menu) {
 		if (cur.IsPlayable() || cur.Type == emby.TypeSeries) && m.Item(str.Play).Chosen() {
 			a.play(&cur, playOptions{})
 		}
+		if cur.IsPlayable() && len(a.extPlayers) > 0 {
+			switch len(a.extPlayers) {
+			case 1:
+				ep := a.extPlayers[0]
+				if m.Item(fmt.Sprintf(str.OpenWithFmt, ep.Name)).Chosen() {
+					a.openExternal(ep, &cur, "", cur.ResumePosition())
+				}
+			default:
+				m.Submenu(str.OpenExternal, func(sub *ui.Menu) {
+					for _, ep := range a.extPlayers {
+						ep := ep
+						if sub.Item(ep.Name).Chosen() {
+							a.openExternal(ep, &cur, "", cur.ResumePosition())
+						}
+					}
+				})
+			}
+		}
 		m.Separator()
 		played := str.MarkPlayed
 		if cur.IsPlayed() {
@@ -29,6 +48,9 @@ func (a *app) itemMenu(it *emby.Item) func(m *ui.Menu) {
 		}
 		if m.Item(played).Chosen() {
 			a.setPlayed(&cur, !cur.IsPlayed())
+		}
+		if cur.CanResume() && m.Item(str.ResetProgress).Chosen() {
+			a.resetProgress(&cur)
 		}
 		fav := str.AddFavorite
 		if cur.IsFavorite() {
@@ -82,12 +104,16 @@ func (a *app) eachItem(fn func(it *emby.Item)) {
 		}
 		each(d.similar)
 		each(d.seasons)
+		each(d.children)
 		for _, eps := range d.episodes {
 			each(eps.items)
 		}
 	}
 	for _, p := range a.people {
 		each(p.works)
+	}
+	for _, g := range a.genres {
+		each(g.items)
 	}
 	if f := a.favs; f != nil {
 		for _, g := range f.groups {
@@ -112,10 +138,15 @@ func (a *app) applyUserData(id string, ud emby.UserData) {
 			it.UserData = &u
 		}
 	})
-	if h := a.home; h != nil && ud.Played {
+	if h := a.home; h != nil && (ud.Played || ud.PlaybackPositionTicks == 0) {
 		h.data.resume = slices.DeleteFunc(h.data.resume, func(it emby.Item) bool { return it.ID == id })
 	}
 	a.redraw() // a menu's choice comes as a frame is built
+}
+
+// resetProgress clears an item's playback progress so it leaves Continue Watching.
+func (a *app) resetProgress(it *emby.Item) {
+	a.setPlayed(it, false)
 }
 
 // userData returns the user's state of it, never nil.

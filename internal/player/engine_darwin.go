@@ -96,6 +96,7 @@ func openVideo(url string) (engine, error) {
 		e.Close()
 		return nil, errors.New("native video: could not create AVPlayerLayer")
 	}
+	avSend(e.layer, "setBackgroundColor:", avSend(avSend(objc.ID(objc.GetClass("NSColor")), "blackColor"), "CGColor"))
 	avSend(e.layer, "setPlayer:", e.player)
 	gravity := avSend(objc.ID(objc.GetClass("NSString")), "stringWithUTF8String:", "AVLayerVideoGravityResizeAspect")
 	avSend(e.layer, "setVideoGravity:", gravity)

@@ -34,6 +34,7 @@ type reportJob struct {
 	kind    reportKind
 	report  emby.PlaybackReport
 	session string // play session of a transcode to stop
+	release func() // release shared server work after the stopped report
 }
 
 // reportClient is what the reporter needs of *emby.Client.
@@ -92,14 +93,33 @@ func (r *reporter) send(j reportJob) {
 // finish queues the stopped report and, for a transcode, its stop; the
 // goroutine ends once they went.
 func (r *reporter) finish(stopped emby.PlaybackReport, transcodeSession string) {
+	r.finishJobs(stopped, reportJob{kind: reportStopTranscode, session: transcodeSession})
+}
+
+func (r *reporter) finishWithRelease(stopped emby.PlaybackReport, release func()) {
+	if r == nil {
+		if release != nil {
+			release()
+		}
+		return
+	}
+	r.finishJobs(stopped, reportJob{kind: reportStopTranscode, release: release})
+}
+
+func (r *reporter) finishJobs(stopped emby.PlaybackReport, cleanup reportJob) {
 	if r == nil {
 		return
 	}
-	r.send(reportJob{kind: reportStopped, report: stopped})
-	if transcodeSession != "" {
-		r.send(reportJob{kind: reportStopTranscode, session: transcodeSession})
-	}
 	r.mu.Lock()
+	if r.done {
+		r.mu.Unlock()
+		return
+	}
+	r.done = true
+	r.queue = append(r.queue, reportJob{kind: reportStopped, report: stopped})
+	if cleanup.session != "" || cleanup.release != nil {
+		r.queue = append(r.queue, cleanup)
+	}
 	r.queue = append(r.queue, reportJob{kind: 255}) // the end
 	r.mu.Unlock()
 	select {
@@ -144,6 +164,10 @@ func (r *reporter) run() {
 }
 
 func (r *reporter) do(j reportJob) {
+	if j.release != nil {
+		j.release()
+		return
+	}
 	if r.client == nil {
 		return
 	}

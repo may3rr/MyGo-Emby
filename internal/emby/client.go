@@ -69,6 +69,7 @@ func WithHTTPClient(h *http.Client) Option {
 // Client talks to one Emby or Jellyfin server. It is safe for concurrent use.
 type Client struct {
 	base   string // normalized, no trailing slash, e.g. "https://host/emby"
+	origin string // canonical scheme://host for credential origin checks
 	device DeviceInfo
 	http   *http.Client
 
@@ -83,14 +84,39 @@ func NewClient(serverURL string, device DeviceInfo, opts ...Option) (*Client, er
 	if err != nil {
 		return nil, err
 	}
+	baseURL, _ := url.Parse(base)
 	c := &Client{
 		base:   base,
+		origin: canonicalOrigin(baseURL),
 		device: device,
 		http:   &http.Client{Timeout: 45 * time.Second},
 	}
 	for _, o := range opts {
 		o(c)
 	}
+	hc := *c.http
+	prevRedirect := hc.CheckRedirect
+	hc.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if !c.sameOrigin(req.URL) {
+			req.Header.Del("Authorization")
+			req.Header.Del("X-Emby-Authorization")
+			req.Header.Del("X-Emby-Token")
+		} else if len(via) > 0 && c.sameOrigin(via[0].URL) {
+			for _, k := range []string{"Authorization", "X-Emby-Authorization", "X-Emby-Token"} {
+				if v := via[0].Header.Get(k); v != "" && req.Header.Get(k) == "" {
+					req.Header.Set(k, v)
+				}
+			}
+		}
+		if prevRedirect != nil {
+			return prevRedirect(req, via)
+		}
+		if len(via) >= 10 {
+			return errors.New("stopped after 10 redirects")
+		}
+		return nil
+	}
+	c.http = &hc
 	c.session.ServerURL = base
 	return c, nil
 }
@@ -294,7 +320,7 @@ func (c *Client) doToken(ctx context.Context, token, method, path string, q url.
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.apiURL(path, q), rd)
 	if err != nil {
-		return &Error{Kind: KindInvalidURL, Op: op, Err: err}
+		return &Error{Kind: KindInvalidURL, Op: op, Err: redactTransportErr(err)}
 	}
 	req.Header.Set("Accept", "application/json")
 	if body != nil {
@@ -307,7 +333,7 @@ func (c *Client) doToken(ctx context.Context, token, method, path string, q url.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		return &Error{Kind: KindUnreachable, Op: op, Err: err}
+		return &Error{Kind: KindUnreachable, Op: op, Err: redactTransportErr(err)}
 	}
 	defer resp.Body.Close()
 
@@ -329,7 +355,7 @@ func (c *Client) doToken(ctx context.Context, token, method, path string, q url.
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return ctxErr
 		}
-		return &Error{Kind: KindUnreachable, Op: op, StatusCode: resp.StatusCode, Err: err}
+		return &Error{Kind: KindUnreachable, Op: op, StatusCode: resp.StatusCode, Err: redactTransportErr(err)}
 	}
 	if len(bytes.TrimSpace(data)) == 0 {
 		return nil
@@ -344,21 +370,23 @@ func (c *Client) doToken(ctx context.Context, token, method, path string, q url.
 	return nil
 }
 
-// fetchRaw GETs an absolute URL with auth headers and returns the body
-// (at most limit bytes). Used for subtitles.
+// fetchRaw GETs an absolute URL (attaching auth headers only when same-origin)
+// and returns the body (at most limit bytes). Used for subtitles.
 func (c *Client) fetchRaw(ctx context.Context, rawURL string, limit int64) ([]byte, error) {
 	op := "GET " + redactURL(rawURL)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return nil, &Error{Kind: KindInvalidURL, Op: op, Err: err}
+		return nil, &Error{Kind: KindInvalidURL, Op: op, Err: redactTransportErr(err)}
 	}
-	c.setAuthHeaders(req.Header, c.Token())
+	if c.sameOrigin(req.URL) {
+		c.setAuthHeaders(req.Header, c.Token())
+	}
 	resp, err := c.http.Do(req)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, &Error{Kind: KindUnreachable, Op: op, Err: err}
+		return nil, &Error{Kind: KindUnreachable, Op: op, Err: redactTransportErr(err)}
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
@@ -371,9 +399,38 @@ func (c *Client) fetchRaw(ctx context.Context, rawURL string, limit int64) ([]by
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, ctxErr
 		}
-		return nil, &Error{Kind: KindUnreachable, Op: op, StatusCode: resp.StatusCode, Err: err}
+		return nil, &Error{Kind: KindUnreachable, Op: op, StatusCode: resp.StatusCode, Err: redactTransportErr(err)}
 	}
 	return data, nil
+}
+
+func (c *Client) sameOrigin(u *url.URL) bool {
+	return c.origin != "" && canonicalOrigin(u) == c.origin
+}
+
+func canonicalOrigin(u *url.URL) string {
+	if u == nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	scheme := strings.ToLower(u.Scheme)
+	host := strings.ToLower(u.Host)
+	switch scheme {
+	case "http":
+		host = strings.TrimSuffix(host, ":80")
+	case "https":
+		host = strings.TrimSuffix(host, ":443")
+	}
+	return scheme + "://" + host
+}
+
+func redactTransportErr(err error) error {
+	var uerr *url.Error
+	if errors.As(err, &uerr) && uerr != nil {
+		cp := *uerr
+		cp.URL = RedactURL(cp.URL)
+		return &cp
+	}
+	return err
 }
 
 // redactURL drops the query string (which may hold a token) for error text.
@@ -382,6 +439,32 @@ func redactURL(s string) string {
 		return s[:i]
 	}
 	return s
+}
+
+// RedactURL masks sensitive credential parameters (such as api_key or token)
+// while keeping non-secret query parameters readable for diagnostics. If raw
+// cannot be parsed as a URL, it falls back to stripping the query string.
+func RedactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return redactURL(raw)
+	}
+	if u.User != nil {
+		u.User = url.User("REDACTED")
+	}
+	q := u.Query()
+	changed := false
+	for k := range q {
+		switch strings.ToLower(k) {
+		case "api_key", "apikey", "token", "x-emby-token", "access_token":
+			q.Set(k, "REDACTED")
+			changed = true
+		}
+	}
+	if changed {
+		u.RawQuery = q.Encode()
+	}
+	return u.String()
 }
 
 // isContextErr reports whether err is a context cancellation or deadline.

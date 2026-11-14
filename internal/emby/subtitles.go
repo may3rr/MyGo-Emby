@@ -108,50 +108,161 @@ func ParseSubtitles(data []byte) (*Subtitles, error) {
 	lines := strings.Split(text, "\n")
 
 	var cues []Cue
-	for i := 0; i < len(lines); i++ {
-		line := strings.TrimSpace(lines[i])
-		if !strings.Contains(line, "-->") {
-			continue
-		}
-		// Skip WebVTT NOTE/STYLE/REGION blocks: they never contain "-->"
-		// on a line of their own except by accident, so no special casing
-		// is needed beyond requiring a valid timing line.
-		start, end, ok := parseTimingLine(line)
-		if !ok {
-			continue
-		}
-		var body []string
-		for i+1 < len(lines) {
-			next := lines[i+1]
-			if strings.TrimSpace(next) == "" {
-				break
+	if looksLikeASS(lines) {
+		cues = parseASSSubtitles(lines)
+	}
+	if len(cues) == 0 {
+		for i := 0; i < len(lines); i++ {
+			line := strings.TrimSpace(lines[i])
+			if !strings.Contains(line, "-->") {
+				continue
 			}
-			if strings.Contains(next, "-->") {
-				if _, _, ok := parseTimingLine(strings.TrimSpace(next)); ok {
-					break // cue without blank separator (sloppy SRT)
+			// Skip WebVTT NOTE/STYLE/REGION blocks: they never contain "-->"
+			// on a line of their own except by accident, so no special casing
+			// is needed beyond requiring a valid timing line.
+			start, end, ok := parseTimingLine(line)
+			if !ok {
+				continue
+			}
+			var body []string
+			for i+1 < len(lines) {
+				next := lines[i+1]
+				if strings.TrimSpace(next) == "" {
+					break
+				}
+				if strings.Contains(next, "-->") {
+					if _, _, ok := parseTimingLine(strings.TrimSpace(next)); ok {
+						break // cue without blank separator (sloppy SRT)
+					}
+				}
+				body = append(body, next)
+				i++
+			}
+			// Sloppy SRT without blank separator leaves the next cue's numeric
+			// id as the last body line; drop it.
+			if n := len(body); n > 0 && i+1 < len(lines) && strings.Contains(lines[i+1], "-->") {
+				if _, err := strconv.Atoi(strings.TrimSpace(body[n-1])); err == nil {
+					body = body[:n-1]
 				}
 			}
-			body = append(body, next)
-			i++
-		}
-		// Sloppy SRT without blank separator leaves the next cue's numeric
-		// id as the last body line; drop it.
-		if n := len(body); n > 0 && i+1 < len(lines) && strings.Contains(lines[i+1], "-->") {
-			if _, err := strconv.Atoi(strings.TrimSpace(body[n-1])); err == nil {
-				body = body[:n-1]
+			txt := cleanCueText(strings.Join(body, "\n"))
+			if txt == "" || end <= start {
+				continue
 			}
+			cues = append(cues, Cue{Start: start, End: end, Text: txt})
 		}
-		txt := cleanCueText(strings.Join(body, "\n"))
-		if txt == "" || end <= start {
-			continue
-		}
-		cues = append(cues, Cue{Start: start, End: end, Text: txt})
+	}
+	if len(cues) == 0 {
+		cues = parseASSSubtitles(lines)
 	}
 	s := NewSubtitles(cues)
 	if len(cues) == 0 {
 		return s, ErrNoCues
 	}
 	return s, nil
+}
+
+func looksLikeASS(lines []string) bool {
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" {
+			continue
+		}
+		if strings.Contains(line, "-->") {
+			return false
+		}
+		low := strings.ToLower(line)
+		if low == "[script info]" || low == "[events]" || low == "[v4+ styles]" || low == "[v4 styles]" {
+			return true
+		}
+	}
+	return false
+}
+
+// parseASSSubtitles extracts Dialogue lines from ASS/SSA subtitle scripts.
+func parseASSSubtitles(lines []string) []Cue {
+	startIdx, endIdx, textIdx, numFields := 1, 2, 9, 10
+	section := ""
+	var cues []Cue
+	for _, raw := range lines {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, ";") {
+			continue
+		}
+		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
+			section = strings.ToLower(line)
+			continue
+		}
+		if colon := strings.IndexByte(line, ':'); colon > 0 {
+			key := strings.ToLower(strings.TrimSpace(line[:colon]))
+			val := strings.TrimSpace(line[colon+1:])
+			switch key {
+			case "format":
+				if section == "[events]" || section == "" {
+					cols := strings.Split(val, ",")
+					si, ei, ti := -1, -1, -1
+					for idx, col := range cols {
+						switch strings.ToLower(strings.TrimSpace(col)) {
+						case "start":
+							si = idx
+						case "end":
+							ei = idx
+						case "text":
+							ti = idx
+						}
+					}
+					if si >= 0 && ei >= 0 && ti >= 0 && len(cols) > ti {
+						startIdx, endIdx, textIdx, numFields = si, ei, ti, len(cols)
+					}
+				}
+			case "dialogue":
+				if section != "" && section != "[events]" {
+					continue
+				}
+				fields := strings.SplitN(val, ",", numFields)
+				if len(fields) <= textIdx || len(fields) <= startIdx || len(fields) <= endIdx {
+					continue
+				}
+				start, ok1 := parseTimestamp(strings.TrimSpace(fields[startIdx]))
+				end, ok2 := parseTimestamp(strings.TrimSpace(fields[endIdx]))
+				if !ok1 || !ok2 || end <= start {
+					continue
+				}
+				txt := cleanASSText(fields[textIdx])
+				if txt == "" {
+					continue
+				}
+				cues = append(cues, Cue{Start: start, End: end, Text: txt})
+			}
+		}
+	}
+	return cues
+}
+
+// cleanASSText strips all {...} override/comment blocks and vector drawing
+// runs ({\p1}...{\p0}) before normalizing line breaks and whitespace.
+func cleanASSText(raw string) string {
+	var b strings.Builder
+	drawing := false
+	for i := 0; i < len(raw); {
+		if raw[i] == '{' {
+			if j := strings.IndexByte(raw[i:], '}'); j > 0 {
+				tag := raw[i+1 : i+j]
+				for k := 0; k < len(tag)-2; k++ {
+					if tag[k] == '\\' && tag[k+1] == 'p' && tag[k+2] >= '0' && tag[k+2] <= '9' {
+						drawing = tag[k+2] != '0'
+					}
+				}
+				i += j + 1
+				continue
+			}
+		}
+		if !drawing {
+			b.WriteByte(raw[i])
+		}
+		i++
+	}
+	return cleanCueText(b.String())
 }
 
 // parseTimingLine parses "00:01.000 --> 00:04.000 align:start" (WebVTT) or

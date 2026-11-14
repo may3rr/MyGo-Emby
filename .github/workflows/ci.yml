@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
+
+      - name: Go vet
+        run: CGO_ENABLED=0 go vet ./...
+
+      - name: MyGo UI lifecycle vet
+        run: go tool mygo vet .
+
+      - name: Build (macOS / Linux / Windows, CGO_ENABLED=0)
+        run: |
+          CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build ./...
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build ./...
+          CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build ./...
+
+      - name: Run internal test suite with race detector
+        run: CGO_ENABLED=0 go test -race ./internal/...

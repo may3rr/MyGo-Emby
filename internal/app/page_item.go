@@ -2,14 +2,19 @@ package app
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net/url"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
 	"mygo-emby/internal/emby"
+	"mygo-emby/internal/remux"
 )
 
 // An item's page (DESIGN.md §4.4): its backdrop across the top, fading
@@ -27,7 +32,8 @@ type detailState struct {
 	next     *emby.Item // a series' episode to play: the next one up
 	similar  []emby.Item
 	seasons  []emby.Item
-	season   string // the season whose episodes show
+	children []emby.Item // items in a BoxSet or Playlist
+	season   string      // the season whose episodes show
 	episodes map[string]*episodeList
 
 	// The version, audio track and subtitles chosen; "" and nil for the
@@ -53,15 +59,17 @@ type episodeList struct {
 
 // detailData is what loading an item's page brings.
 type detailData struct {
-	item    *emby.Item
-	next    *emby.Item
-	similar []emby.Item
-	seasons []emby.Item
+	item     *emby.Item
+	next     *emby.Item
+	similar  []emby.Item
+	seasons  []emby.Item
+	children []emby.Item
 }
 
 // fetchDetail asks for an item and, at once, what is like it and, for a
-// series, its seasons and the episode up next. Only the item must come:
-// the rest is left out where it fails.
+// series, its seasons and the episode up next (or, for a box set or
+// playlist, its items). Only the item must come: the rest is left out
+// where it fails.
 func fetchDetail(ctx context.Context, cl *emby.Client, id string) (detailData, error) {
 	it, err := cl.Item(ctx, id)
 	if err != nil {
@@ -74,7 +82,8 @@ func fetchDetail(ctx context.Context, cl *emby.Client, id string) (detailData, e
 			d.similar = items
 		}
 	})
-	if it.Type == emby.TypeSeries {
+	switch it.Type {
+	case emby.TypeSeries:
 		wg.Go(func() {
 			if items, err := cl.Seasons(ctx, id); err == nil {
 				d.seasons = items
@@ -83,6 +92,17 @@ func fetchDetail(ctx context.Context, cl *emby.Client, id string) (detailData, e
 		wg.Go(func() {
 			if items, err := cl.NextUp(ctx, id, 1); err == nil && len(items) > 0 {
 				d.next = &items[0]
+			}
+		})
+	case emby.TypeBoxSet, emby.TypePlaylist:
+		wg.Go(func() {
+			q := emby.ItemQuery{ParentID: id, Limit: 200}
+			if it.Type == emby.TypeBoxSet {
+				q.SortBy = []string{emby.SortProductionYear, emby.SortPremiereDate, emby.SortName}
+				q.SortOrder = emby.Ascending
+			}
+			if res, err := cl.Items(ctx, q); err == nil {
+				d.children = res.Items
 			}
 		})
 	}
@@ -122,7 +142,7 @@ func (a *app) loadDetail(d *detailState, id string) {
 			d.err = err
 			return
 		}
-		d.item, d.next, d.similar, d.seasons, d.err = r.item, r.next, r.similar, r.seasons, nil
+		d.item, d.next, d.similar, d.seasons, d.children, d.err = r.item, r.next, r.similar, r.seasons, r.children, nil
 		d.episodes = map[string]*episodeList{}
 		if !slices.ContainsFunc(d.seasons, func(s emby.Item) bool { return s.ID == d.season }) {
 			d.season = defaultSeason(d.seasons, d.next)
@@ -209,6 +229,12 @@ func (a *app) itemPage(c *ui.Context, r *ui.Route, id string) {
 				if it.Type == emby.TypeSeries && len(d.seasons) > 0 {
 					a.seasonsSection(c, d)
 				}
+				if (it.Type == emby.TypeBoxSet || it.Type == emby.TypePlaylist) && len(d.children) > 0 {
+					a.collectionSection(c, d)
+				}
+				if it.IsPlayable() && len(it.Chapters) > 0 {
+					a.chaptersShelf(c, d)
+				}
 				a.castShelf(c, it)
 				a.itemShelf(c, "similar", str.Similar, d.similar, "", false, false, nil)
 			})
@@ -255,18 +281,31 @@ func (a *app) itemHeader(c *ui.Context, d *detailState, backdrop string) {
 			parts := []string{it.YearText()}
 			if it.RunTimeTicks > 0 && it.Type != emby.TypeSeries {
 				parts = append(parts, runtimeText(it.Runtime()))
+			} else if (it.Type == emby.TypeBoxSet || it.Type == emby.TypePlaylist) && len(d.children) > 0 {
+				var total time.Duration
+				for i := range d.children {
+					total += d.children[i].Runtime()
+				}
+				if total > 0 {
+					parts = append(parts, runtimeText(total))
+				}
 			}
 			if n := len(d.seasons); it.Type == emby.TypeSeries && n > 0 {
 				parts = append(parts, fmt.Sprintf("%d 季", n))
+			}
+			if n := len(d.children); (it.Type == emby.TypeBoxSet || it.Type == emby.TypePlaylist) && n > 0 {
+				parts = append(parts, itemCountText(n))
 			}
 			a.metaRow(c, metaSpec{Parts: parts, Rating: it.CommunityRating, Badge: it.OfficialRating})
 			if len(it.Genres) > 0 {
 				ui.Row(c.Key("genres")).Gap(6).Wrap().Children(func() {
 					for _, g := range it.Genres[:min(len(it.Genres), 5)] {
-						a.chip(c, g, false)
+						genre := g
+						a.chip(c, genre, true).OnClick(func() { a.navigate(pathGenre(genre)) })
 					}
 				})
 			}
+			a.mediaSpecsRow(c, d)
 			a.itemButtons(c, d)
 			a.trackChoices(c, d)
 		})
@@ -284,6 +323,7 @@ func (a *app) itemHeader(c *ui.Context, d *detailState, backdrop string) {
 		if ss := it.StudioNames(); len(ss) > 0 {
 			a.factLine(c, str.Studios, strings.Join(ss[:min(len(ss), 3)], "、"))
 		}
+		a.externalLinksRow(c, it)
 	})
 }
 
@@ -320,12 +360,21 @@ func (a *app) factLine(c *ui.Context, label, value string) {
 // up next, and how the page's main button names it.
 func playTarget(d *detailState) (*emby.Item, string) {
 	it := d.item
-	if it.Type == emby.TypeSeries {
+	switch it.Type {
+	case emby.TypeSeries:
 		if n := d.next; n != nil {
 			if n.CanResume() {
 				return n, fmt.Sprintf(str.ResumeEpisodeFmt, episodeText(n))
 			}
 			return n, fmt.Sprintf(str.PlayEpisodeFmt, episodeText(n))
+		}
+		return it, str.Play
+	case emby.TypeBoxSet, emby.TypePlaylist:
+		if target := pickCollectionPlayTarget(d.children); target != nil {
+			if target.CanResume() {
+				return target, str.Resume
+			}
+			return target, str.PlayCollection
 		}
 		return it, str.Play
 	}
@@ -338,20 +387,115 @@ func playTarget(d *detailState) (*emby.Item, string) {
 	return it, str.Play
 }
 
+func pickCollectionPlayTarget(items []emby.Item) *emby.Item {
+	var firstUnplayed, firstPlayable *emby.Item
+	for i := range items {
+		it := &items[i]
+		if !it.IsPlayable() {
+			continue
+		}
+		if firstPlayable == nil {
+			firstPlayable = it
+		}
+		if it.CanResume() {
+			return it
+		}
+		if !it.IsPlayed() && firstUnplayed == nil {
+			firstUnplayed = it
+		}
+	}
+	if firstUnplayed != nil {
+		return firstUnplayed
+	}
+	return firstPlayable
+}
+
+func safeExternalURL(raw string) (string, bool) {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	if !strings.EqualFold(u.Scheme, "http") && !strings.EqualFold(u.Scheme, "https") {
+		return "", false
+	}
+	return u.String(), true
+}
+
+func (a *app) externalLinksRow(c *ui.Context, it *emby.Item) {
+	if len(it.ExternalURLs) == 0 {
+		return
+	}
+	type extLink struct{ name, url string }
+	var links []extLink
+	seen := map[string]bool{}
+	for _, ext := range it.ExternalURLs {
+		name := strings.TrimSpace(ext.Name)
+		href, ok := safeExternalURL(ext.URL)
+		if !ok || name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		links = append(links, extLink{name: name, url: href})
+	}
+	if len(links) == 0 {
+		return
+	}
+	p := a.pal
+	svc := c.Services()
+	ui.Row(c.Key("external-links")).Gap(10).AlignItems(ui.Center).Wrap().Children(func() {
+		ui.Text(c, str.ExternalLinks).FontSize(fsBody).TextColor(p.text2).Shrink(0)
+		ui.Row(c).Gap(6).Wrap().Children(func() {
+			for _, lnk := range links {
+				href := lnk.url
+				a.chip(c, lnk.name, true).OnClick(func() {
+					if a.onOpenURL != nil {
+						a.onOpenURL(href)
+						return
+					}
+					svc.OpenURL(href)
+				})
+			}
+		})
+	})
+}
+
+func (a *app) collectionSection(c *ui.Context, d *detailState) {
+	ui.Column(c.Key("collection-items")).Gap(titleGap).Children(func() {
+		a.sectionTitle(c, str.CollectionItems+" · "+itemCountText(len(d.children)), nil)
+		ui.Row(c.Key("grid")).Gap(cardGap).Wrap().AlignItems(ui.Start).Children(func() {
+			for i := range d.children {
+				a.itemCard(c, &d.children[i], cardOpts{width: posterWidth})
+			}
+		})
+	})
+}
+
 // itemButtons are the page's actions: play (or resume), play from the
 // start, favorite, watched.
 func (a *app) itemButtons(c *ui.Context, d *detailState) {
 	it := d.item
 	target, label := playTarget(d)
 	opts := playOptions{MediaSourceID: d.source, AudioIndex: d.audio, SubtitleIndex: d.sub}
+	if target == it {
+		if src := d.chosenSource(); src != nil {
+			opts.MediaSourceID = src.ID
+		}
+	}
+	canPlay := target != it || len(it.MediaSources) == 0 || len(d.playableSources()) > 0
 	ui.Row(c.Key("buttons")).Gap(10).Margin(6, 0, 0, 0).Wrap().Children(func() {
 		if target.IsPlayable() || target.Type == emby.TypeSeries {
 			t := *target
-			a.pillButton(c, iconPlay, label, pillPrimary).OnClick(func() { a.play(&t, opts) })
+			play := a.pillButton(c, iconPlay, label, pillPrimary).Disabled(!canPlay)
+			if canPlay {
+				play.OnClick(func() { a.play(&t, opts) })
+			}
 			if t.CanResume() {
 				from := opts
 				from.FromStart = true
-				a.pillButton(c, iconRefresh, str.PlayFromStart, pillSecondary).OnClick(func() { a.play(&t, from) })
+				resume := a.pillButton(c, iconRefresh, str.PlayFromStart, pillSecondary).Disabled(!canPlay)
+				if canPlay {
+					resume.OnClick(func() { a.play(&t, from) })
+				}
 			}
 		}
 		fav, favIcon, favKind := str.AddFavorite, iconHeart, pillPlain
@@ -364,20 +508,267 @@ func (a *app) itemButtons(c *ui.Context, d *detailState) {
 			played, playedKind = str.PlayedDone, pillSecondary
 		}
 		a.pillButton(c, iconCheckCircle, played, playedKind).OnClick(func() { a.setPlayed(it, !it.IsPlayed()) })
+		if target.IsPlayable() && len(a.extPlayers) > 0 {
+			extItem := *target
+			startPos := extItem.ResumePosition()
+			if len(a.extPlayers) == 1 {
+				ep := a.extPlayers[0]
+				a.pillButton(c, iconExternal, fmt.Sprintf(str.OpenWithFmt, ep.Name), pillPlain).
+					OnClick(func() { a.openExternal(ep, &extItem, opts.MediaSourceID, startPos) })
+			} else {
+				a.pillButton(c, iconExternal, str.OpenExternal, pillPlain).PopoverMenuButton(func(m *ui.Menu) {
+					for _, ep := range a.extPlayers {
+						ep := ep
+						if m.Item(ep.Name).Chosen() {
+							a.openExternal(ep, &extItem, opts.MediaSourceID, startPos)
+						}
+					}
+				})
+			}
+		}
 	})
 }
 
-// source returns the version the page plays: the one chosen, else the
-// first.
-func (d *detailState) chosenSource() *emby.MediaSource {
-	srcs := d.item.MediaSources
-	for i := range srcs {
-		if srcs[i].ID == d.source {
-			return &srcs[i]
+func (a *app) mediaSpecsRow(c *ui.Context, d *detailState) {
+	badges := mediaSpecBadges(d.chosenSource(), d.audio)
+	if len(badges) == 0 {
+		return
+	}
+	p := a.pal
+	ui.Row(c.Key("specs")).Gap(6).Wrap().Children(func() {
+		for i, b := range badges {
+			ui.Row(c.Key(i)).Height(20).PaddingX(7).Radius(5).
+				Border(1, p.hairline).Background(p.fill.Alpha(0.55)).
+				AlignItems(ui.Center).Children(func() {
+				ui.Text(c, b).FontSize(fsSmall).FontWeight(wSemibold).TextColor(p.text2).
+					FontFeatures("tnum").SingleLine()
+			})
+		}
+	})
+}
+
+func mediaSpecBadges(src *emby.MediaSource, audioIdx *int) []string {
+	if src == nil {
+		return nil
+	}
+	var out []string
+	if v := src.VideoStream(); v != nil {
+		if res := resolutionBadge(v.Width, v.Height); res != "" {
+			out = append(out, res)
+		}
+		if hdr := hdrBadge(v.VideoRangeType, v.VideoRange); hdr != "" {
+			out = append(out, hdr)
+		}
+		if codec := videoCodecBadge(v.Codec); codec != "" {
+			out = append(out, codec)
 		}
 	}
-	if len(srcs) > 0 {
-		return &srcs[0]
+	if aud := selectedAudioStream(src, audioIdx); aud != nil {
+		if ab := audioSpecBadge(aud); ab != "" {
+			out = append(out, ab)
+		}
+	}
+	if src.Container != "" {
+		c := src.Container
+		if i := strings.IndexByte(c, ','); i >= 0 {
+			c = c[:i]
+		}
+		c = strings.TrimSpace(c)
+		if c != "" {
+			out = append(out, strings.ToUpper(c))
+		}
+	}
+	if src.Size > 0 {
+		out = append(out, byteSize(src.Size))
+	}
+	return out
+}
+
+func resolutionBadge(w, h int) string {
+	switch {
+	case w >= 3800 || h >= 2100:
+		return "4K"
+	case w >= 1900 || h >= 1060:
+		return "1080p"
+	case w >= 1260 || h >= 700:
+		return "720p"
+	case h > 0:
+		return strconv.Itoa(h) + "p"
+	}
+	return ""
+}
+
+func hdrBadge(rangeType, videoRange string) string {
+	rt := strings.ToLower(strings.TrimSpace(rangeType))
+	vr := strings.ToLower(strings.TrimSpace(videoRange))
+	switch {
+	case strings.Contains(rt, "dovi") || strings.Contains(rt, "dolby"):
+		return "Dolby Vision"
+	case strings.Contains(rt, "hdr10+") || strings.Contains(rt, "hdr10plus"):
+		return "HDR10+"
+	case strings.Contains(rt, "hdr10"):
+		return "HDR10"
+	case strings.Contains(rt, "hlg"):
+		return "HLG"
+	case vr != "" && vr != "sdr":
+		return strings.ToUpper(strings.TrimSpace(videoRange))
+	}
+	return ""
+}
+
+func videoCodecBadge(codec string) string {
+	c := strings.ToLower(strings.TrimSpace(codec))
+	switch c {
+	case "":
+		return ""
+	case "h264", "avc", "avc1":
+		return "H.264"
+	case "hevc", "h265", "hev1", "hvc1":
+		return "HEVC"
+	case "av1", "av01":
+		return "AV1"
+	}
+	return strings.ToUpper(c)
+}
+
+func selectedAudioStream(src *emby.MediaSource, audioIdx *int) *emby.MediaStream {
+	if audioIdx != nil {
+		if s := src.Stream(*audioIdx); s != nil && s.Type == emby.StreamAudio {
+			return s
+		}
+	}
+	if src.DefaultAudioStreamIndex != nil {
+		if s := src.Stream(*src.DefaultAudioStreamIndex); s != nil && s.Type == emby.StreamAudio {
+			return s
+		}
+	}
+	for i := range src.MediaStreams {
+		if src.MediaStreams[i].Type == emby.StreamAudio {
+			return &src.MediaStreams[i]
+		}
+	}
+	return nil
+}
+
+func audioSpecBadge(s *emby.MediaStream) string {
+	var parts []string
+	if s.Codec != "" {
+		parts = append(parts, strings.ToUpper(strings.TrimSpace(s.Codec)))
+	}
+	switch s.Channels {
+	case 8:
+		parts = append(parts, "7.1")
+	case 6:
+		parts = append(parts, "5.1")
+	case 2:
+		parts = append(parts, "2.0")
+	case 1:
+		parts = append(parts, "1.0")
+	default:
+		if s.Channels > 0 {
+			parts = append(parts, strconv.Itoa(s.Channels)+"ch")
+		}
+	}
+	return strings.Join(parts, " ")
+}
+
+func (a *app) chaptersShelf(c *ui.Context, d *detailState) {
+	it := d.item
+	if len(it.Chapters) == 0 {
+		return
+	}
+	srcID := d.source
+	if src := d.chosenSource(); src != nil {
+		srcID = src.ID
+	}
+	const itemW = float32(200)
+	const artH = itemW * 9.0 / 16.0
+	a.shelf(c, shelfSpec{
+		Key:       "chapters",
+		Title:     str.Chapters,
+		Count:     len(it.Chapters),
+		ItemWidth: itemW,
+		ArtHeight: artH,
+		Item: func(i int) {
+			ch := it.Chapters[i]
+			title := strings.TrimSpace(ch.Name)
+			if title == "" {
+				title = fmt.Sprintf(str.ChapterNumFmt, i+1)
+			}
+			var imgURL string
+			if a.client != nil && ch.ImageTag != "" {
+				imgURL = a.client.ImageURL(it.ID, emby.ImageChapter, emby.ImageOptions{
+					Index:    i,
+					Tag:      ch.ImageTag,
+					MaxWidth: a.imgPx(itemW),
+					Quality:  85,
+				})
+			}
+			itCopy := *it
+			start := ch.Start()
+			a.landscapeCard(c, cardSpec{
+				Key:      fmt.Sprintf("ch-%d-%d", i, ch.StartPositionTicks),
+				Title:    title,
+				Subtitle: emby.FormatClock(start),
+				Image:    imgURL,
+				Fallback: iconFilm,
+				Width:    itemW,
+				OnOpen: func() {
+					a.play(&itCopy, playOptions{
+						StartAt:       start,
+						HasStartAt:    true,
+						MediaSourceID: srcID,
+						AudioIndex:    d.audio,
+						SubtitleIndex: d.sub,
+					})
+				},
+			})
+		},
+	})
+}
+
+// sourcePlayable reports whether a version can play without an unavailable
+// server transcode. Missing metadata remains a candidate for the player's
+// read-only probe.
+func sourcePlayable(src *emby.MediaSource) bool {
+	if src == nil {
+		return false
+	}
+	d := remux.Decide(src, -1)
+	if src.SupportsTranscoding || d.Mode != remux.Unsupported {
+		return true
+	}
+	if errors.Is(d.Err, remux.ErrUnsupportedFormat) {
+		return false
+	}
+	video := src.VideoStream()
+	return video != nil && strings.TrimSpace(video.Codec) == ""
+}
+
+func (d *detailState) playableSources() []*emby.MediaSource {
+	if d.item == nil {
+		return nil
+	}
+	sources := make([]*emby.MediaSource, 0, len(d.item.MediaSources))
+	for i := range d.item.MediaSources {
+		if src := &d.item.MediaSources[i]; sourcePlayable(src) {
+			sources = append(sources, src)
+		}
+	}
+	return sources
+}
+
+// chosenSource returns the version the page plays: the one chosen when it
+// remains playable, else the first playable version.
+func (d *detailState) chosenSource() *emby.MediaSource {
+	sources := d.playableSources()
+	for _, src := range sources {
+		if src.ID == d.source {
+			return src
+		}
+	}
+	if len(sources) > 0 {
+		return sources[0]
 	}
 	return nil
 }
@@ -397,19 +788,20 @@ func streamLabel(s emby.MediaStream) string {
 // play the item with, for what plays and has more than one of them.
 func (a *app) trackChoices(c *ui.Context, d *detailState) {
 	it := d.item
-	if !it.IsPlayable() || len(it.MediaSources) == 0 {
+	sources := d.playableSources()
+	if !it.IsPlayable() || len(sources) == 0 {
 		return
 	}
 	src := d.chosenSource()
 	audios := src.Streams(emby.StreamAudio)
 	subs := src.Streams(emby.StreamSubtitle)
-	if len(it.MediaSources) < 2 && len(audios) < 2 && len(subs) == 0 {
+	if len(sources) < 2 && len(audios) < 2 && len(subs) == 0 {
 		return
 	}
 	ui.Row(c.Key("tracks")).Gap(8).Wrap().Margin(2, 0, 0, 0).Children(func() {
-		if len(it.MediaSources) > 1 {
+		if len(sources) > 1 {
 			a.dropdown(c, "version", str.Version, src.DisplayName(), func(m *ui.Menu) {
-				for _, s := range it.MediaSources {
+				for _, s := range sources {
 					if m.Item(s.DisplayName()).Radio(s.ID == src.ID).Chosen() {
 						d.source, d.audio, d.sub = s.ID, nil, nil
 					}

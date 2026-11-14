@@ -377,6 +377,78 @@ func TestRemuxFallbackExplainsMissingAudioTranscoder(t *testing.T) {
 	}
 }
 
+func TestRemuxFallbackExplainsDiscImage(t *testing.T) {
+	p := &emby.Playback{
+		Source: emby.MediaSource{
+			Container: "blurayiso",
+			MediaStreams: []emby.MediaStream{
+				{Index: 0, Type: emby.StreamVideo, Codec: "hevc", IsDefault: true},
+				{Index: 1, Type: emby.StreamAudio, Codec: "truehd", IsDefault: true},
+			},
+		},
+	}
+	_, err := RemuxFallback(nil)(context.Background(), p, Request{})
+	var unplayable *UnplayableError
+	if !errors.As(err, &unplayable) {
+		t.Fatalf("disc image error = %v", err)
+	}
+	if unplayable.Reason != str.ErrDiscImage {
+		t.Fatalf("disc image reason = %q", unplayable.Reason)
+	}
+	if !errors.Is(err, ErrUnplayable) || !errors.Is(err, remux.ErrUnsupportedFormat) {
+		t.Fatalf("disc image cause chain = %v", err)
+	}
+	if !strings.Contains(err.Error(), "blurayiso") {
+		t.Fatalf("disc image error lost diagnostic cause: %v", err)
+	}
+}
+
+func TestRemuxFallbackPreservesUnsupportedVideoCause(t *testing.T) {
+	p := &emby.Playback{
+		Source: emby.MediaSource{
+			Container: "mkv",
+			MediaStreams: []emby.MediaStream{
+				{Index: 0, Type: emby.StreamVideo, Codec: "vc1", IsDefault: true},
+				{Index: 1, Type: emby.StreamAudio, Codec: "ac3", IsDefault: true},
+			},
+		},
+	}
+	_, err := RemuxFallback(nil)(context.Background(), p, Request{})
+	if !errors.Is(err, ErrUnplayable) || !errors.Is(err, remux.ErrUnsupportedVideo) {
+		t.Fatalf("unsupported video cause chain = %v", err)
+	}
+	if !strings.Contains(err.Error(), "video codec vc1 needs transcoding") {
+		t.Fatalf("unsupported video error lost diagnostic cause: %v", err)
+	}
+}
+
+func TestRemuxFallbackPreservesUnsupportedAudioCause(t *testing.T) {
+	srv, err := remux.NewServer(remux.WithFFmpeg(""))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	files := httptest.NewServer(http.FileServer(http.Dir(filepath.Join("..", "remux", "testdata"))))
+	defer files.Close()
+	p := &emby.Playback{
+		StreamURL: files.URL + "/mkv_hevc_dts.mkv",
+		Source: emby.MediaSource{
+			Container: "mkv",
+			MediaStreams: []emby.MediaStream{
+				{Index: 0, Type: emby.StreamVideo, Codec: "hevc", IsDefault: true},
+				{Index: 1, Type: emby.StreamAudio, Codec: "aac", IsDefault: true},
+			},
+		},
+	}
+	_, err = RemuxFallback(srv)(context.Background(), p, Request{})
+	if !errors.Is(err, ErrUnplayable) || !errors.Is(err, remux.ErrUnsupportedAudio) {
+		t.Fatalf("unsupported audio cause chain = %v", err)
+	}
+	if !strings.Contains(err.Error(), "audio codec dts is not supported by AVPlayer without transcoding") {
+		t.Fatalf("unsupported audio error lost diagnostic cause: %v", err)
+	}
+}
+
 func compatDecodeAudio(t *testing.T, file string) []byte {
 	t.Helper()
 	cmd := exec.Command(compatFFmpeg(t), "-v", "error", "-i", file, "-map", "0:a:0",

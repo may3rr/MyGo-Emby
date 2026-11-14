@@ -118,10 +118,11 @@ type Item struct {
 	AlbumArtist string   `json:"AlbumArtist,omitempty"`
 	Artists     []string `json:"Artists,omitempty"`
 
-	UserData     *UserData     `json:"UserData,omitempty"`
-	MediaSources []MediaSource `json:"MediaSources,omitempty"`
-	MediaStreams []MediaStream `json:"MediaStreams,omitempty"`
-	Chapters     []Chapter     `json:"Chapters,omitempty"`
+	UserData     *UserData                         `json:"UserData,omitempty"`
+	MediaSources []MediaSource                     `json:"MediaSources,omitempty"`
+	MediaStreams []MediaStream                     `json:"MediaStreams,omitempty"`
+	Chapters     []Chapter                         `json:"Chapters,omitempty"`
+	Trickplay    map[string]map[string]TrickplayInfo `json:"Trickplay,omitempty"`
 }
 
 // NameID is a name with an optional id (studios, genre items).

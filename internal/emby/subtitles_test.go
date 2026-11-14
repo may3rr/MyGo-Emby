@@ -178,3 +178,43 @@ func TestFetchSubtitles(t *testing.T) {
 		t.Errorf("missing subtitle: %v", err)
 	}
 }
+
+func TestParseASSSubtitles(t *testing.T) {
+	ass := "\xef\xbb\xbf[Script Info]\r\n" +
+		"Title: Demo\r\n" +
+		"[V4+ Styles]\r\n" +
+		"Format: Name, Fontname, Fontsize\r\n" +
+		"Style: Default,Arial,40\r\n" +
+		"[Events]\r\n" +
+		"Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\r\n" +
+		"Dialogue: 0,0:00:01.05,0:00:04.50,Default,,0,0,0,,{\\an8\\pos(100,200)}Hello, world!\\NSecond\\hLine{note}\r\n" +
+		"Dialogue: 0,0:00:05.00,0:00:08.00,Default,,0,0,0,,{\\p1}m 0 0 l 100 100{\\p0}Sign --> Here\r\n" +
+		"Dialogue: 0,0:00:09.00,0:00:10.00,Default,,0,0,0,,{\\p1}m 0 0 l 10 10{\\p0}\r\n"
+
+	s, err := ParseSubtitles([]byte(ass))
+	if err != nil {
+		t.Fatalf("ParseSubtitles(ASS): %v", err)
+	}
+	if s.Len() != 2 {
+		t.Fatalf("got %d cues, want 2: %+v", s.Len(), s.Cues)
+	}
+	if got := s.Cues[0]; got.Start != 1050*time.Millisecond || got.End != 4500*time.Millisecond || got.Text != "Hello, world!\nSecond Line" {
+		t.Errorf("cue 0 = %+v", got)
+	}
+	if got := s.Cues[1]; got.Text != "Sign --> Here" {
+		t.Errorf("cue 1 = %+v", got)
+	}
+}
+
+func TestParseASSCustomColumnOrder(t *testing.T) {
+	ssa := "[Events]\n" +
+		"Format: Text, End, Start\n" +
+		"Dialogue: Short line,0:00:03.00,0:00:01.00\n"
+	s, err := ParseSubtitles([]byte(ssa))
+	if err != nil || s.Len() != 1 {
+		t.Fatalf("ParseSubtitles(custom order) = %v, %+v", err, s)
+	}
+	if s.Cues[0].Text != "Short line" || s.Cues[0].Start != time.Second || s.Cues[0].End != 3*time.Second {
+		t.Errorf("cue = %+v", s.Cues[0])
+	}
+}

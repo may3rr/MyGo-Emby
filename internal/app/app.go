@@ -70,13 +70,16 @@ type app struct {
 	lists   map[string]*listState
 	details map[string]*detailState
 	people  map[string]*personState
+	genres  map[string]*genreState
 	favs    *favState
 	found   *searchState
 	// staleEpisodes says a series or a season was marked watched: the
 	// episodes loaded go once the server confirms it.
 	staleEpisodes bool
 
-	lastPlay *playRequest // what play was last asked
+	lastPlay       *playRequest // what play was last asked
+	extPlayers     []externalPlayer
+	launchExternal func(ep externalPlayer, streamURL, title string, start time.Duration) error
 
 	// form is the settings page's controls.
 	form settingsForm
@@ -117,7 +120,8 @@ type app struct {
 
 	// postFn, when set, takes what update would post to the main thread,
 	// as in tests, which have no window.
-	postFn func(func())
+	postFn    func(func())
+	onOpenURL func(string)
 }
 
 // library is a library of the server, as the sidebar lists it. Kind is the
@@ -144,6 +148,9 @@ func newAppWith(settingsPath, cacheDir string, secrets secretStore) *app {
 	a.img = newImageCache(a.http, cacheDir, a.update)
 	a.resetData()
 	a.loadAccounts()
+	if settingsPath != "" {
+		a.detectExternalPlayersAsync()
+	}
 	return a
 }
 
@@ -386,6 +393,9 @@ func (a *app) focusSearch() {
 	}
 	a.showWindow()
 	a.searchBox.Focus()
+	if a.screen == screenMain && a.search == "" && len(a.settings.SearchHistory) > 0 && a.router.Path() != "/search" {
+		a.router.Push("/search")
+	}
 }
 
 // refresh asks the page shown to load what it shows again (⌘R), and lets
